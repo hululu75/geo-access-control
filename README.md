@@ -23,11 +23,11 @@ A Traefik middleware plugin for controlling access based on geographic location 
 
 ## Configuration
 
-The plugin uses a powerful, unified configuration for both geo-based and IP-based access control. All rules are defined under the `allowedLists` field.
+The plugin uses a powerful, unified configuration for both geo-based and IP-based access control. All rules are defined under the `accessRules` field.
 
 ### Rule Structure and Precedence
 
-The `allowedLists` field is a map where keys can be a country code, an IP address, or a CIDR range. The value for each key determines the action: `true` to allow, `false` to deny.
+The `accessRules` field is a map where keys can be a country code, an IP address, or a CIDR range. The value for each key determines the action: `true` to allow, `false` to deny.
 
 The filtering logic follows a strict order of precedence:
 1.  **IP Rules**: If the request's IP matches an IP or CIDR rule, that rule is final. An IP deny (`false`) will block the request, and an IP allow (`true`) will permit it, overriding any geo-rules.
@@ -39,7 +39,7 @@ The filtering logic follows a strict order of precedence:
 ### Example Configuration
 
 ```yaml
-allowedLists:
+accessRules:
   # --- IP-Based Rules (Highest Priority) ---
   "1.1.1.1": false       # Explicitly deny this IP
   "8.8.0.0/16": true     # Explicitly allow this CIDR range
@@ -76,8 +76,10 @@ http:
     geo-full-config:
       plugin:
         geo-access-control:
-          api: "http://geoip-api:8080/country/{ip}"
-          allowedLists:
+          geoAPIEndpoint: "http://my-geo-api.com/lookup/{ip}" # Required: URL of your geo IP API. {ip} will be replaced by the client's IP.
+          geoAPITimeoutMilliseconds: 500                      # Optional: Timeout for the API request in milliseconds. Default is 750ms.
+          geoAPIResponseIsJSON: true                    # Optional: If your API returns JSON. Default is true.
+          accessRules:
             # IP Rules
             "10.0.0.0/8": false
             "192.168.1.100": true
@@ -89,16 +91,130 @@ http:
               regions:
                 SCO: false
 
-          allowLocalRequests: true
-          allowUnknownCountries: false
-          # ... other options
+          allowPrivateIPAccess: true
+          allowRequestsWithoutGeoData: false
+          cacheSize: 100
+          deniedStatusCode: 403
+          deniedResponseMessage: "Access Denied!"
+          redirectURL: "https://example.com/denied"
+          addCountryCodeHeader: true
+          addRegionCodeHeader: true
+          addCityNameHeader: true
+          excludedPaths: ["/metrics", "/health"]
+          logAllowedAccess: true
+          logDeniedAccess: true
+          logGeoAPICalls: true
+          logPrivateIPAccess: true
+          logLevel: "info"                                    # Optional: Log level. Options: debug, info, warn, error. Default is info.
+          logFilePath: "/var/log/traefik/geo-access.log"     # Optional: Save logs to file for fail2ban integration. Default is empty (Traefik logs only).
+          suppressStartupLogs: true
 ```
 
 ## Configuration Options
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `allowedLists` | `map[string]interface{}` | `{}` | **Unified map of allow/deny rules.** Keys are country codes or IPs/CIDRs. Values are `true` (allow) or `false` (deny), or a map for nested rules. |
-| ... (other options remain, `blackListMode` is removed) |
+| `geoAPIEndpoint` | `string` | `"http://geoip-api:8080/country/{ip}"` | URL of your geo IP API. `{ip}` will be replaced by the client's IP. |
+| `geoAPITimeoutMilliseconds` | `int` | `750` | Timeout for the API request in milliseconds. |
+| `geoAPIResponseIsJSON` | `boolean` | `true` | If your API returns JSON. |
+| `accessRules` | `map[string]interface{}` | `{}` | **Unified map of allow/deny rules.** Keys are country codes or IPs/CIDR. Values are `true` (allow) or `false` (deny), or a map for nested rules. |
+| `allowPrivateIPAccess` | `boolean` | `true` | Allow requests from private IP ranges (e.g., 10.0.0.0/8, 192.168.0.0/16). |
+| `allowRequestsWithoutGeoData` | `boolean` | `false` | Allow requests if the geographic data cannot be determined by the API. |
+| `cacheSize` | `int` | `100` | Size of the LRU cache for geo IP lookups. |
+| `deniedStatusCode` | `int` | `403` | HTTP status code to return for denied requests. |
+| `deniedResponseMessage` | `string` | `"Access Denied"` | Message to return for denied requests. |
+| `redirectURL` | `string` | `""` | URL to redirect to for denied requests. Overrides `deniedStatusCode` and `deniedResponseMessage`. |
+| `addCountryCodeHeader` | `boolean` | `false` | Add `X-Country-Code` header to the request. |
+| `addRegionCodeHeader` | `boolean` | `false` | Add `X-Region-Code` header to the request. |
+| `addCityNameHeader` | `boolean` | `false` | Add `X-City-Name` header to the request. |
+| `excludedPaths` | `[]string` | `[]` | A list of regular expression patterns for paths that should be excluded from geo-access control checks. |
+| `logAllowedAccess` | `boolean` | `false` | Log allowed requests. |
+| `logDeniedAccess` | `boolean` | `false` | Log blocked requests. |
+| `logGeoAPICalls` | `boolean` | `false` | Log requests to the Geo IP API. |
+| `logPrivateIPAccess` | `boolean` | `false` | Log requests from private IP ranges. |
+| `logLevel` | `string` | `"info"` | Log level: `debug`, `info`, `warn`, or `error`. |
+| `logFilePath` | `string` | `""` | Path to save logs to file. If empty, logs only output to Traefik. Can be used for fail2ban integration. |
+| `suppressStartupLogs` | `boolean` | `false` | Suppress startup logs. |
 
-(Rest of the README would follow, with updated Use Cases and Comparison table)
+## Logging and fail2ban Integration
+
+### Log Levels
+
+The plugin supports four log levels via the `logLevel` configuration option:
+
+- **debug**: Most verbose. Logs all requests with full URL paths (e.g., `https://example.com/api/users`), API calls, cache hits, and detailed processing information.
+- **info** (default): Logs allowed/denied requests (if enabled) showing only the website name (e.g., `example.com`), warnings, and errors.
+- **warn**: Logs only warnings and errors, showing website name only.
+- **error**: Logs only errors, showing website name only.
+
+**URL Format by Log Level:**
+- `debug`: Full URL with path → `https://example.com/api/users`
+- `info`/`warn`/`error`: Website name only → `example.com`
+
+**Log Examples:**
+
+Debug level:
+```
+[geo-access-control] [DEBUG] Processing request from IP: 1.2.3.4 to https://example.com/api/users
+[geo-access-control] [WARN] Denied request from IP: 1.2.3.4 (CN, , ) to https://example.com/api/users by geo rule
+```
+
+Info level:
+```
+[geo-access-control] [INFO] Allowed request from IP: 5.6.7.8 (US, CA, Los Angeles) to example.com by geo rule
+[geo-access-control] [WARN] Denied request from IP: 1.2.3.4 (CN, , ) to example.com by geo rule
+```
+
+### Log File Path
+
+By default, logs are output to stderr and appear in Traefik's logs. You can configure `logFilePath` to save logs to a separate file:
+
+```yaml
+logFilePath: "/var/log/traefik/geo-access.log"
+```
+
+When `logFilePath` is set:
+- Logs are written to **both** stderr (Traefik logs) and the specified file
+- This is useful for fail2ban integration, allowing you to monitor blocked requests separately
+
+### fail2ban Integration Example
+
+To use this plugin with fail2ban for additional protection:
+
+1. **Configure the plugin to log denied requests to a file:**
+
+```yaml
+http:
+  middlewares:
+    geo-access:
+      plugin:
+        geo-access-control:
+          logDeniedAccess: true
+          logFilePath: "/var/log/traefik/geo-access.log"
+          logLevel: "info"
+```
+
+2. **Create a fail2ban filter** (`/etc/fail2ban/filter.d/traefik-geo-access.conf`):
+
+```ini
+[Definition]
+failregex = ^\[.*\] \[WARN\] Denied request from IP: <HOST> .* to .* by (explicit IP rule|geo rule)$
+ignoreregex =
+```
+
+**Note:** The log format shows the website name (e.g., `example.com`) at info level and above, and full URL path at debug level.
+
+3. **Create a fail2ban jail** (`/etc/fail2ban/jail.d/traefik-geo-access.conf`):
+
+```ini
+[traefik-geo-access]
+enabled = true
+port = http,https
+filter = traefik-geo-access
+logpath = /var/log/traefik/geo-access.log
+maxretry = 5
+findtime = 600
+bantime = 3600
+```
+
+This configuration will ban IPs that are denied by geo-access rules 5 times within 10 minutes for 1 hour.

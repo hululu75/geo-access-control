@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"log"
 	"net/http"
+	"os"
 	"regexp"
 	"strings"
 	"time"
@@ -27,39 +29,42 @@ type CountryRules struct {
 
 // Config holds the plugin configuration.
 type Config struct {
-	API                   string                 `json:"api,omitempty"`
-	APITimeoutMs          int                    `json:"apiTimeoutMs,omitempty"`
-	UseJSONFormat         bool                   `json:"useJSONFormat,omitempty"`
-	AllowedLists          map[string]interface{} `json:"allowedLists,omitempty"`
-	AllowLocalRequests    bool                   `json:"allowLocalRequests,omitempty"`
-	AllowUnknownCountries bool                   `json:"allowUnknownCountries,omitempty"`
+	GeoAPIEndpoint        string                 `json:"api,omitempty"`
+	GeoAPITimeout         int                    `json:"apiTimeout,omitempty"`
+	GeoAPIResponseIsJSON  bool                   `json:"useJSONFormat,omitempty"`
+	AccessRules           map[string]interface{} `json:"allowedLists,omitempty"`
+	AllowPrivateIPAccess  bool                   `json:"allowLocalRequests,omitempty"`
+	AllowRequestsWithoutGeoData bool                   `json:"allowUnknownCountries,omitempty"`
 	CacheSize             int                    `json:"cacheSize,omitempty"`
-	DeniedHTTPStatusCode  int                    `json:"deniedHTTPStatusCode,omitempty"`
-	DeniedMessage         string                 `json:"deniedMessage,omitempty"`
+	DeniedStatusCode      int                    `json:"deniedHTTPStatusCode,omitempty"`
+	DeniedResponseMessage string                 `json:"deniedMessage,omitempty"`
 	RedirectURL           string                 `json:"redirectURL,omitempty"`
-	AddCountryHeader      bool                   `json:"addCountryHeader,omitempty"`
-	AddRegionHeader       bool                   `json:"addRegionHeader,omitempty"`
-	AddCityHeader         bool                   `json:"addCityHeader,omitempty"`
-	ExcludedPathPatterns  []string               `json:"excludedPathPatterns,omitempty"`
-	LogAllowedRequests    bool                   `json:"logAllowedRequests,omitempty"`
-	LogBlockedRequests    bool                   `json:"logBlockedRequests,omitempty"`
-	LogAPIRequests        bool                   `json:"logAPIRequests,omitempty"`
-	LogLocalRequests      bool                   `json:"logLocalRequests,omitempty"`
-	SilentStartUp         bool                   `json:"silentStartUp,omitempty"`
+	AddCountryCodeHeader  bool                   `json:"addCountryHeader,omitempty"`
+	AddRegionCodeHeader   bool                   `json:"addRegionHeader,omitempty"`
+	AddCityNameHeader     bool                   `json:"addCityHeader,omitempty"`
+	ExcludedPaths         []string               `json:"excludedPathPatterns,omitempty"`
+	LogAllowedAccess      bool                   `json:"logAllowedRequests,omitempty"`
+	LogDeniedAccess       bool                   `json:"logBlockedRequests,omitempty"`
+	LogGeoAPICalls        bool                   `json:"logAPIRequests,omitempty"`
+	LogPrivateIPAccess    bool                   `json:"logLocalRequests,omitempty"`
+	LogLevel              string                 `json:"logLevel,omitempty"`
+	LogFilePath           string                 `json:"logFilePath,omitempty"`
 }
 
 // CreateConfig creates and initializes the default plugin configuration.
 func CreateConfig() *Config {
 	return &Config{
-		API:                   "http://geoip-api:8080/country/{ip}",
-		APITimeoutMs:          750,
-		UseJSONFormat:         true,
-		AllowedLists:          make(map[string]interface{}),
-		AllowLocalRequests:    true,
-		AllowUnknownCountries: false,
+		GeoAPIEndpoint:          "http://geoip-api:8080/country/{ip}",
+		GeoAPITimeout:           750, // GeoAPI timeout in milliseconds
+		GeoAPIResponseIsJSON:         true,
+		AccessRules:           make(map[string]interface{}),
+		AllowPrivateIPAccess:    true,
+		AllowRequestsWithoutGeoData: false,
 		CacheSize:             100,
-		DeniedHTTPStatusCode:  http.StatusForbidden,
-		DeniedMessage:         "Access Denied",
+		DeniedStatusCode:      http.StatusForbidden,
+		DeniedResponseMessage:         "Access Denied",
+		LogLevel:              "info", // Default log level
+		LogFilePath:           "",     // Default empty log file path
 	}
 }
 
@@ -75,6 +80,7 @@ type GeoAccessControl struct {
 	allowedIPs          []*net.IPNet
 	deniedIPs           []*net.IPNet
 	httpClient          *http.Client
+	logger              *PluginLogger
 }
 
 // GeoData holds geolocation information from API.
@@ -94,7 +100,26 @@ type APIResponse struct {
 
 // New creates a new plugin instance.
 func New(ctx context.Context, next http.Handler, config *Config, name string) (http.Handler, error) {
-	if config.API == "" {
+	// Setup logging
+	var logWriter io.Writer = os.Stderr
+	if config.LogFilePath != "" {
+		logFile, err := os.OpenFile(config.LogFilePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+		if err != nil {
+			return nil, fmt.Errorf("failed to open log file: %w", err)
+		}
+		// TODO: Add a way to close the log file when the plugin is stopped.
+		// For Traefik plugins, there isn't a direct "shutdown" hook, so this might be tricky.
+		// For now, it will remain open for the lifetime of the plugin.
+		logWriter = io.MultiWriter(os.Stderr, logFile)
+	}
+
+	pluginLogger := &PluginLogger{
+		logger: log.New(logWriter, fmt.Sprintf("[%s] ", name), log.Ldate|log.Ltime|log.Lshortfile),
+		level:  parseLogLevel(config.LogLevel),
+	}
+
+	if config.GeoAPIEndpoint == "" {
+		pluginLogger.Errorf("API endpoint is required")
 		return nil, fmt.Errorf("API endpoint is required")
 	}
 
@@ -104,14 +129,15 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 		config: config,
 		cache:  NewLRUCache(config.CacheSize),
 		httpClient: &http.Client{
-			Timeout: time.Duration(config.APITimeoutMs) * time.Millisecond,
+			Timeout: time.Duration(config.GeoAPITimeout) * time.Millisecond,
 		},
+		logger: pluginLogger,
 	}
 
 	plugin.allowedRules = make(map[string]CountryRules)
 	var allowedIPStrings, deniedIPStrings []string
 
-	for key, configValue := range config.AllowedLists {
+	for key, configValue := range config.AccessRules {
 		isCountryCode := len(key) == 2 && key == strings.ToUpper(key)
 		isIP := net.ParseIP(key) != nil || strings.Contains(key, "/")
 
@@ -161,7 +187,8 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 	}
 
 	if len(plugin.allowedRules) == 0 && len(allowedIPStrings) == 0 && len(deniedIPStrings) == 0 {
-		return nil, fmt.Errorf("at least one rule must be specified in 'allowedLists'")
+		plugin.logger.Errorf("at least one rule must be specified in 'accessRules'")
+		return nil, fmt.Errorf("at least one rule must be specified in 'accessRules'")
 	}
 
 	var err error
@@ -170,12 +197,14 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 	if len(allowedIPStrings) > 0 {
 		plugin.allowedIPs, err = parseIPRanges(allowedIPStrings)
 		if err != nil {
+			plugin.logger.Errorf("failed to parse allowed IPs: %w", err)
 			return nil, fmt.Errorf("failed to parse allowed IPs: %w", err)
 		}
 	}
 	if len(deniedIPStrings) > 0 {
 		plugin.deniedIPs, err = parseIPRanges(deniedIPStrings)
 		if err != nil {
+			plugin.logger.Errorf("failed to parse denied IPs: %w", err)
 			return nil, fmt.Errorf("failed to parse denied IPs: %w", err)
 		}
 	}
@@ -187,47 +216,71 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 func (g *GeoAccessControl) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	clientIP := g.extractClientIP(req)
 	if clientIP == "" {
+		g.logger.Warnf("Unable to extract client IP for request to %s", req.Host)
 		g.denyRequest(rw, req, "No client IP found")
 		return
 	}
 
+	g.logger.Debugf("Processing request from IP: %s to %s", clientIP, g.formatURL(req))
+
 	if decision, determined := g.checkIPRules(clientIP); determined {
 		if decision {
+			if g.config.LogAllowedAccess {
+				g.logger.Infof("Allowed request from IP: %s to %s by explicit IP rule", clientIP, g.formatURLForLevel(req, g.logger.level))
+			}
 			g.next.ServeHTTP(rw, req)
 		} else {
+			if g.config.LogDeniedAccess {
+				g.logger.Warnf("Denied request from IP: %s to %s by explicit IP rule", clientIP, g.formatURLForLevel(req, g.logger.level))
+			}
 			g.denyRequest(rw, req, "IP address is denied")
 		}
 		return
 	}
 
-	if g.config.AllowLocalRequests && g.isPrivateIP(clientIP) {
+	if g.config.AllowPrivateIPAccess && g.isPrivateIP(clientIP) {
+		if g.config.LogPrivateIPAccess {
+			g.logger.Infof("Allowed private IP access for: %s to %s", clientIP, g.formatURLForLevel(req, g.logger.level))
+		}
 		g.next.ServeHTTP(rw, req)
 		return
 	}
 
 	geoData, err := g.getGeoData(clientIP)
 	if err != nil {
-		if g.config.AllowUnknownCountries {
+		if g.config.LogDeniedAccess {
+			g.logger.Errorf("Error getting geo data for IP %s to %s: %v", clientIP, g.formatURLForLevel(req, g.logger.level), err)
+		}
+		if g.config.AllowRequestsWithoutGeoData {
+			if g.config.LogAllowedAccess {
+				g.logger.Infof("Allowed request from IP: %s to %s due to missing geo data (allowUnknownCountries enabled)", clientIP, g.formatURLForLevel(req, g.logger.level))
+			}
 			g.next.ServeHTTP(rw, req)
 		} else {
 			g.denyRequest(rw, req, "Could not determine location")
 		}
 		return
 	}
-	
-	if g.config.AddCountryHeader && geoData.Country != "" {
+
+	if g.config.AddCountryCodeHeader && geoData.Country != "" {
 		req.Header.Set("X-Country-Code", geoData.Country)
 	}
-	if g.config.AddRegionHeader && geoData.Region != "" {
+	if g.config.AddRegionCodeHeader && geoData.Region != "" {
 		req.Header.Set("X-Region-Code", geoData.Region)
 	}
-	if g.config.AddCityHeader && geoData.City != "" {
+	if g.config.AddCityNameHeader && geoData.City != "" {
 		req.Header.Set("X-City-Name", geoData.City)
 	}
 
 	if g.checkGeoAccess(geoData) {
+		if g.config.LogAllowedAccess {
+			g.logger.Infof("Allowed request from IP: %s (%s, %s, %s) to %s by geo rule", clientIP, geoData.Country, geoData.Region, geoData.City, g.formatURLForLevel(req, g.logger.level))
+		}
 		g.next.ServeHTTP(rw, req)
 	} else {
+		if g.config.LogDeniedAccess {
+			g.logger.Warnf("Denied request from IP: %s (%s, %s, %s) to %s by geo rule", clientIP, geoData.Country, geoData.Region, geoData.City, g.formatURLForLevel(req, g.logger.level))
+		}
 		g.denyRequest(rw, req, "Location is not allowed")
 	}
 }
@@ -309,15 +362,16 @@ func (g *GeoAccessControl) checkGeoAccess(geoData *GeoData) bool {
 // getGeoData retrieves geolocation data for an IP.
 func (g *GeoAccessControl) getGeoData(ip string) (*GeoData, error) {
 	if cached, found := g.cache.Get(ip); found {
+		g.logger.Debugf("Geo data for IP %s found in cache", ip)
 		return cached.(*GeoData), nil
 	}
 	
-	apiURL := strings.ReplaceAll(g.config.API, "{ip}", ip)
+	apiURL := strings.ReplaceAll(g.config.GeoAPIEndpoint, "{ip}", ip)
 	if g.needsCityLevelData() {
 		apiURL = strings.ReplaceAll(apiURL, "/country/", "/city/")
 	}
 
-	if g.config.UseJSONFormat {
+	if g.config.GeoAPIResponseIsJSON {
 		if strings.Contains(apiURL, "?") {
 			apiURL += "&format=json"
 		} else {
@@ -325,14 +379,20 @@ func (g *GeoAccessControl) getGeoData(ip string) (*GeoData, error) {
 		}
 	}
 
+	if g.config.LogGeoAPICalls {
+		g.logger.Debugf("Making GeoAPI call to: %s for IP: %s", apiURL, ip)
+	}
+
 	resp, err := g.httpClient.Get(apiURL)
 	if err != nil {
+		g.logger.Errorf("Failed to make GeoAPI request to %s for IP %s: %v", apiURL, ip, err)
 		return nil, err
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
+		g.logger.Errorf("Failed to read GeoAPI response body from %s for IP %s: %v", apiURL, ip, err)
 		return nil, err
 	}
 	
@@ -340,12 +400,14 @@ func (g *GeoAccessControl) getGeoData(ip string) (*GeoData, error) {
 	if strings.HasPrefix(string(body), "{") {
 		var apiResp APIResponse
 		if err := json.Unmarshal(body, &apiResp); err != nil {
+			g.logger.Errorf("Failed to unmarshal GeoAPI JSON response from %s for IP %s: %v", apiURL, ip, err)
 			return nil, err
 		}
 		geoData.Country = apiResp.Country
 		geoData.City = apiResp.City
 		geoData.Region = apiResp.Region
 	} else {
+		// Handle plain text response
 		parts := strings.Split(string(body), "|")
 		if len(parts) > 0 {
 			geoData.Country = parts[0]
@@ -368,8 +430,8 @@ func (g *GeoAccessControl) denyRequest(rw http.ResponseWriter, req *http.Request
 		http.Redirect(rw, req, g.config.RedirectURL, http.StatusTemporaryRedirect)
 		return
 	}
-	rw.WriteHeader(g.config.DeniedHTTPStatusCode)
-	rw.Write([]byte(g.config.DeniedMessage))
+	rw.WriteHeader(g.config.DeniedStatusCode)
+	rw.Write([]byte(g.config.DeniedResponseMessage))
 }
 
 // needsCityLevelData checks if city-level data is required.
@@ -410,15 +472,110 @@ func parseIPRanges(ipStrings []string) ([]*net.IPNet, error) {
 			}
 			continue
 		}
+		// Since parseIPRanges is a utility function, it doesn't have access to g.logger directly.
+		// The error will be propagated and logged by the caller (New function).
 		return nil, fmt.Errorf("invalid IP/CIDR address: %s", ipStr)
 	}
 	return ranges, nil
 }
 
-// contains checks if a string is in a slice of strings.
-func contains(list []string, item string) bool {
-	for _, v := range list {
-		if strings.EqualFold(v, item) {
+// LogLevel type for defining log levels.
+type LogLevel int
+
+const (
+	LevelDebug LogLevel = iota
+	LevelInfo
+	LevelWarn
+	LevelError
+)
+
+func parseLogLevel(level string) LogLevel {
+	switch strings.ToLower(level) {
+	case "debug":
+		return LevelDebug
+	case "info":
+		return LevelInfo
+	case "warn":
+		return LevelWarn
+	case "error":
+		return LevelError
+	default:
+		return LevelInfo // Default to info
+	}
+}
+
+// PluginLogger is a custom logger for the plugin.
+type PluginLogger struct {
+	logger *log.Logger
+	level  LogLevel
+}
+
+func (l *PluginLogger) Debugf(format string, v ...interface{}) {
+	if l.level <= LevelDebug {
+		l.logger.Printf("[DEBUG] "+format, v...)
+	}
+}
+
+func (l *PluginLogger) Infof(format string, v ...interface{}) {
+	if l.level <= LevelInfo {
+		l.logger.Printf("[INFO] "+format, v...)
+	}
+}
+
+func (l *PluginLogger) Warnf(format string, v ...interface{}) {
+	if l.level <= LevelWarn {
+		l.logger.Printf("[WARN] "+format, v...)
+	}
+}
+
+func (l *PluginLogger) Errorf(format string, v ...interface{}) {
+	if l.level <= LevelError {
+		l.logger.Printf("[ERROR] "+format, v...)
+	}
+}
+
+func (l *PluginLogger) Fatalf(format string, v ...interface{}) {
+	l.logger.Fatalf("[FATAL] "+format, v...)
+}
+
+func (l *PluginLogger) Printf(format string, v ...interface{}) {
+	l.logger.Printf(format, v...)
+}
+
+// getScheme returns the scheme (http or https) for the request.
+func getScheme(req *http.Request) string {
+	if req.TLS != nil {
+		return "https"
+	}
+	if scheme := req.Header.Get("X-Forwarded-Proto"); scheme != "" {
+		return scheme
+	}
+	if req.URL.Scheme != "" {
+		return req.URL.Scheme
+	}
+	return "http"
+}
+
+// formatURL returns the full URL for debug logging.
+func (g *GeoAccessControl) formatURL(req *http.Request) string {
+	scheme := getScheme(req)
+	return fmt.Sprintf("%s://%s%s", scheme, req.Host, req.URL.Path)
+}
+
+// formatURLForLevel returns URL format based on log level.
+// Debug: full URL with path (e.g., https://example.com/api/users)
+// Info and above: just the host (e.g., example.com)
+func (g *GeoAccessControl) formatURLForLevel(req *http.Request, level LogLevel) string {
+	if level <= LevelDebug {
+		return g.formatURL(req)
+	}
+	return req.Host
+}
+
+// contains checks if a string is in a slice.
+func contains(slice []string, item string) bool {
+	for _, s := range slice {
+		if s == item {
 			return true
 		}
 	}
