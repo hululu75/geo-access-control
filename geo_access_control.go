@@ -23,6 +23,7 @@ type RegionRules struct {
 // CountryRules defines rules for a specific country.
 type CountryRules struct {
 	Allowed bool                   `json:"allowed,omitempty"`
+	Unknown bool                   `json:"unknown,omitempty"` // Allow requests without region info
 	Regions map[string]RegionRules `json:"regions,omitempty"`
 	Cities  []string               `json:"cities,omitempty"`
 }
@@ -142,7 +143,23 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 			countryRule := CountryRules{}
 			if v, ok := configValue.(bool); ok {
 				countryRule.Allowed = v
+			} else if strVal, ok := configValue.(string); ok {
+				// Handle string "true" or "false" from TOML
+				countryRule.Allowed = (strVal == "true" || strVal == "True" || strVal == "TRUE")
 			} else if v, ok := configValue.(map[string]interface{}); ok {
+				// Handle allowed field at country level
+				if allowedVal, ok := v["allowed"].(bool); ok {
+					countryRule.Allowed = allowedVal
+				} else if allowedStr, ok := v["allowed"].(string); ok {
+					countryRule.Allowed = (allowedStr == "true" || allowedStr == "True" || allowedStr == "TRUE")
+				}
+				// Handle unknown field (for requests without region info)
+				if unknownVal, ok := v["unknown"].(bool); ok {
+					countryRule.Unknown = unknownVal
+				} else if unknownStr, ok := v["unknown"].(string); ok {
+					countryRule.Unknown = (unknownStr == "true" || unknownStr == "True" || unknownStr == "TRUE")
+				}
+				// Handle regions
 				if regionsConfig, ok := v["regions"]; ok {
 					countryRule.Regions = make(map[string]RegionRules)
 					if rCfg, ok := regionsConfig.(map[string]interface{}); ok {
@@ -150,7 +167,17 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 							regionRule := RegionRules{}
 							if rrCfg, ok := regionRulesConfig.(bool); ok {
 								regionRule.Allowed = rrCfg
+							} else if strVal, ok := regionRulesConfig.(string); ok {
+								// Handle string "true" or "false" from TOML
+								regionRule.Allowed = (strVal == "true" || strVal == "True" || strVal == "TRUE")
 							} else if rrCfg, ok := regionRulesConfig.(map[string]interface{}); ok {
+								// Handle allowed field
+								if allowedVal, ok := rrCfg["allowed"].(bool); ok {
+									regionRule.Allowed = allowedVal
+								} else if allowedStr, ok := rrCfg["allowed"].(string); ok {
+									regionRule.Allowed = (allowedStr == "true" || allowedStr == "True" || allowedStr == "TRUE")
+								}
+								// Handle cities field
 								if citiesConfig, ok := rrCfg["cities"].([]interface{}); ok {
 									for _, cityItem := range citiesConfig {
 										if cityStr, ok := cityItem.(string); ok {
@@ -173,7 +200,20 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 			}
 			plugin.allowedRules[key] = countryRule
 		} else if isIP {
-			if allowed, ok := configValue.(bool); ok {
+			var allowed bool
+			var parsed bool
+
+			// Try bool type first
+			if boolVal, ok := configValue.(bool); ok {
+				allowed = boolVal
+				parsed = true
+			} else if strVal, ok := configValue.(string); ok {
+				// Handle string "true" or "false" from TOML (workaround for TOML parser issue)
+				allowed = (strVal == "true" || strVal == "True" || strVal == "TRUE")
+				parsed = true
+			}
+
+			if parsed {
 				if allowed {
 					allowedIPStrings = append(allowedIPStrings, key)
 				} else {
@@ -223,12 +263,12 @@ func (g *GeoAccessControl) ServeHTTP(rw http.ResponseWriter, req *http.Request) 
 	if decision, determined := g.checkIPRules(clientIP); determined {
 		if decision {
 			if g.config.LogAllowedAccess {
-				g.logger.Infof("Allowed request from IP: %s to %s by explicit IP rule", clientIP, g.formatURLForLevel(req, g.logger.level))
+				g.logger.Infof("Allowed request from IP: %s to %s (IP whitelist)", clientIP, g.formatURLForLevel(req, g.logger.level))
 			}
 			g.next.ServeHTTP(rw, req)
 		} else {
 			if g.config.LogDeniedAccess {
-				g.logger.Warnf("Denied request from IP: %s to %s by explicit IP rule", clientIP, g.formatURLForLevel(req, g.logger.level))
+				g.logger.Warnf("Denied request from IP: %s to %s (IP blacklist)", clientIP, g.formatURLForLevel(req, g.logger.level))
 			}
 			g.denyRequest(rw, req, "IP address is denied")
 		}
@@ -237,7 +277,7 @@ func (g *GeoAccessControl) ServeHTTP(rw http.ResponseWriter, req *http.Request) 
 
 	if g.config.AllowPrivateIPAccess && g.isPrivateIP(clientIP) {
 		if g.config.LogPrivateIPAccess {
-			g.logger.Infof("Allowed private IP access for: %s to %s", clientIP, g.formatURLForLevel(req, g.logger.level))
+			g.logger.Infof("Allowed request from IP: %s to %s (private IP)", clientIP, g.formatURLForLevel(req, g.logger.level))
 		}
 		g.next.ServeHTTP(rw, req)
 		return
@@ -259,14 +299,15 @@ func (g *GeoAccessControl) ServeHTTP(rw http.ResponseWriter, req *http.Request) 
 		return
 	}
 
-	if g.checkGeoAccess(geoData) {
+	allowed, matchedRule := g.checkGeoAccess(geoData)
+	if allowed {
 		if g.config.LogAllowedAccess {
-			g.logger.Infof("Allowed request from IP: %s (%s, %s, %s) to %s by geo rule", clientIP, geoData.Country, geoData.Region, geoData.City, g.formatURLForLevel(req, g.logger.level))
+			g.logger.Infof("Allowed request from IP: %s (%s, %s, %s) to %s (matched: %s)", clientIP, geoData.Country, geoData.Region, geoData.City, g.formatURLForLevel(req, g.logger.level), matchedRule)
 		}
 		g.next.ServeHTTP(rw, req)
 	} else {
 		if g.config.LogDeniedAccess {
-			g.logger.Warnf("Denied request from IP: %s (%s, %s, %s) to %s by geo rule", clientIP, geoData.Country, geoData.Region, geoData.City, g.formatURLForLevel(req, g.logger.level))
+			g.logger.Warnf("Denied request from IP: %s (%s, %s, %s) to %s (blocked: %s)", clientIP, geoData.Country, geoData.Region, geoData.City, g.formatURLForLevel(req, g.logger.level), matchedRule)
 		}
 		g.denyRequest(rw, req, "Location is not allowed")
 	}
@@ -324,26 +365,52 @@ func (g *GeoAccessControl) checkIPRules(ipStr string) (decision bool, determined
 }
 
 // checkGeoAccess determines if access should be allowed based on geo data and hierarchical rules.
-func (g *GeoAccessControl) checkGeoAccess(geoData *GeoData) bool {
+// Returns (allowed bool, matchedRule string)
+func (g *GeoAccessControl) checkGeoAccess(geoData *GeoData) (bool, string) {
 	if geoData.Country == "" {
-		return false
+		return false, "no country data"
 	}
 	countryRule, countryExists := g.allowedRules[geoData.Country]
 	if !countryExists {
-		return false
+		return false, "country not in rules"
 	}
+
+	// Check if regions are defined
+	hasRegionRules := len(countryRule.Regions) > 0
+
+	// If region info exists, check region rules
 	if geoData.Region != "" {
 		if regionRule, regionExists := countryRule.Regions[geoData.Region]; regionExists {
+			// Region matches - check city rules if any
 			if geoData.City != "" && len(regionRule.Cities) > 0 {
-				return contains(regionRule.Cities, geoData.City)
+				if contains(regionRule.Cities, geoData.City) {
+					return true, fmt.Sprintf("city %s in region %s", geoData.City, geoData.Region)
+				}
+				return false, fmt.Sprintf("city %s not in allowed list", geoData.City)
 			}
-			return regionRule.Allowed
+			return regionRule.Allowed, fmt.Sprintf("region %s", geoData.Region)
 		}
+		// Has region info but doesn't match any defined regions
+		if hasRegionRules {
+			return false, fmt.Sprintf("region %s not in allowed regions", geoData.Region)
+		}
+	} else if hasRegionRules {
+		// No region info - check if "unknown" region rule exists
+		if unknownRule, exists := countryRule.Regions["unknown"]; exists {
+			return unknownRule.Allowed, "region unknown"
+		}
+		// If no "unknown" rule in regions, use country-level 'unknown' field
+		return countryRule.Unknown, "region unknown (country-level)"
 	}
+
+	// Fallback to country-level rules
 	if geoData.City != "" && len(countryRule.Cities) > 0 {
-		return contains(countryRule.Cities, geoData.City)
+		if contains(countryRule.Cities, geoData.City) {
+			return true, fmt.Sprintf("city %s", geoData.City)
+		}
+		return false, "city not in allowed list"
 	}
-	return countryRule.Allowed
+	return countryRule.Allowed, fmt.Sprintf("country %s", geoData.Country)
 }
 
 // getGeoData retrieves geolocation data for an IP.
