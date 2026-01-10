@@ -13,8 +13,8 @@ http:
     geo-simple:
       plugin:
         geo-access-control:
-          api: "http://geoip-api:8080/country/{ip}"
-          allowedLists:
+          geoAPIEndpoint: "http://geoip-api:8080/country/{ip}"
+          accessRules:
             US: true  # Allow US
             CA: true  # Allow Canada
             KP: false # Deny North Korea
@@ -23,8 +23,8 @@ http:
     ip-rules:
       plugin:
         geo-access-control:
-          api: "http://geoip-api:8080/country/{ip}"
-          allowedLists:
+          geoAPIEndpoint: "http://geoip-api:8080/country/{ip}"
+          accessRules:
             "1.1.1.1": false # Deny a specific IP
             "8.8.0.0/16": true # Allow a CIDR range
 
@@ -32,8 +32,8 @@ http:
     geo-complex:
       plugin:
         geo-access-control:
-          api: "http://geoip-api:8080/country/{ip}"
-          allowedLists:
+          geoAPIEndpoint: "http://geoip-api:8080/country/{ip}"
+          accessRules:
             # IP rules take precedence
             "10.0.0.0/8": false
 
@@ -53,16 +53,26 @@ http:
     geo-full:
       plugin:
         geo-access-control:
-          api: "http://geoip-api:8080/country/{ip}"
-          apiTimeoutMs: 1000
-          allowedLists:
+          geoAPIEndpoint: "http://geoip-api:8080/country/{ip}"
+          geoAPITimeoutMilliseconds: 1000
+          geoAPIResponseIsJSON: true
+          accessRules:
             "1.2.3.4": true
             US: true
             KP: false
-          allowLocalRequests: true
-          allowUnknownCountries: false
-          deniedHTTPStatusCode: 403
-          # ... other options
+          allowPrivateIPAccess: true
+          allowRequestsWithoutGeoData: false
+          deniedStatusCode: 403
+          deniedResponseMessage: "Access Denied"
+          redirectURL: ""
+          cacheSize: 100
+          excludedPaths: ["/health", "/metrics"]
+          logAllowedAccess: false
+          logDeniedAccess: true
+          logGeoAPICalls: false
+          logPrivateIPAccess: false
+          logLevel: "info"
+          logFilePath: "/var/log/traefik/geo-access.log"
 
   routers:
     my-app:

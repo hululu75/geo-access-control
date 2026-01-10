@@ -1,13 +1,13 @@
 displayName: Geo Access Control
 type: middleware
 
-import: github.com/yourusername/geo-access-control
+import: github.com/hululu75/geo-access-control
 
 summary: 'Block or allow requests based on geographic location (country, region, city)'
 
 testData:
-  allowedCountries:
-    - US
-    - CA
-    - GB
-  api: "http://geoip-api:8080/country/{ip}"
+  geoAPIEndpoint: "http://geoip-api:8080/country/{ip}"
+  accessRules:
+    US: true
+    CA: true
+    GB: true

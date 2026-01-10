@@ -29,21 +29,21 @@ type CountryRules struct {
 
 // Config holds the plugin configuration.
 type Config struct {
-	GeoAPIEndpoint        string                 `json:"api,omitempty"`
-	GeoAPITimeout         int                    `json:"apiTimeout,omitempty"`
-	GeoAPIResponseIsJSON  bool                   `json:"useJSONFormat,omitempty"`
-	AccessRules           map[string]interface{} `json:"allowedLists,omitempty"`
-	AllowPrivateIPAccess  bool                   `json:"allowLocalRequests,omitempty"`
-	AllowRequestsWithoutGeoData bool                   `json:"allowUnknownCountries,omitempty"`
+	GeoAPIEndpoint        string                 `json:"geoAPIEndpoint,omitempty"`
+	GeoAPITimeout         int                    `json:"geoAPITimeoutMilliseconds,omitempty"`
+	GeoAPIResponseIsJSON  bool                   `json:"geoAPIResponseIsJSON,omitempty"`
+	AccessRules           map[string]interface{} `json:"accessRules,omitempty"`
+	AllowPrivateIPAccess  bool                   `json:"allowPrivateIPAccess,omitempty"`
+	AllowRequestsWithoutGeoData bool                   `json:"allowRequestsWithoutGeoData,omitempty"`
 	CacheSize             int                    `json:"cacheSize,omitempty"`
-	DeniedStatusCode      int                    `json:"deniedHTTPStatusCode,omitempty"`
-	DeniedResponseMessage string                 `json:"deniedMessage,omitempty"`
+	DeniedStatusCode      int                    `json:"deniedStatusCode,omitempty"`
+	DeniedResponseMessage string                 `json:"deniedResponseMessage,omitempty"`
 	RedirectURL           string                 `json:"redirectURL,omitempty"`
-	ExcludedPaths         []string               `json:"excludedPathPatterns,omitempty"`
-	LogAllowedAccess      bool                   `json:"logAllowedRequests,omitempty"`
-	LogDeniedAccess       bool                   `json:"logBlockedRequests,omitempty"`
-	LogGeoAPICalls        bool                   `json:"logAPIRequests,omitempty"`
-	LogPrivateIPAccess    bool                   `json:"logLocalRequests,omitempty"`
+	ExcludedPaths         []string               `json:"excludedPaths,omitempty"`
+	LogAllowedAccess      bool                   `json:"logAllowedAccess,omitempty"`
+	LogDeniedAccess       bool                   `json:"logDeniedAccess,omitempty"`
+	LogGeoAPICalls        bool                   `json:"logGeoAPICalls,omitempty"`
+	LogPrivateIPAccess    bool                   `json:"logPrivateIPAccess,omitempty"`
 	LogLevel              string                 `json:"logLevel,omitempty"`
 	LogFilePath           string                 `json:"logFilePath,omitempty"`
 }
