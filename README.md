@@ -13,7 +13,6 @@ A Traefik middleware plugin for controlling access based on geographic location 
 - **LRU caching**: Fast IP lookups with configurable cache size.
 - **Path exclusion**: Exclude specific paths from filtering (regex support).
 - **Custom responses**: Configurable HTTP status codes, messages, or redirects.
-- **Header injection**: Add location information to request headers.
 - **Private IP handling**: Optionally bypass filtering for local requests.
 - **Comprehensive logging**: Detailed logging options for debugging and monitoring.
 
@@ -94,12 +93,9 @@ http:
           allowPrivateIPAccess: true
           allowRequestsWithoutGeoData: false
           cacheSize: 100
-          deniedStatusCode: 403
+          deniedStatusCode: 404
           deniedResponseMessage: "Access Denied!"
           redirectURL: "https://example.com/denied"
-          addCountryCodeHeader: true
-          addRegionCodeHeader: true
-          addCityNameHeader: true
           excludedPaths: ["/metrics", "/health"]
           logAllowedAccess: true
           logDeniedAccess: true
@@ -107,7 +103,6 @@ http:
           logPrivateIPAccess: true
           logLevel: "info"                                    # Optional: Log level. Options: debug, info, warn, error. Default is info.
           logFilePath: "/var/log/traefik/geo-access.log"     # Optional: Save logs to file for fail2ban integration. Default is empty (Traefik logs only).
-          suppressStartupLogs: true
 ```
 
 ## Configuration Options
@@ -121,12 +116,9 @@ http:
 | `allowPrivateIPAccess` | `boolean` | `true` | Allow requests from private IP ranges (e.g., 10.0.0.0/8, 192.168.0.0/16). |
 | `allowRequestsWithoutGeoData` | `boolean` | `false` | Allow requests if the geographic data cannot be determined by the API. |
 | `cacheSize` | `int` | `100` | Size of the LRU cache for geo IP lookups. |
-| `deniedStatusCode` | `int` | `403` | HTTP status code to return for denied requests. |
-| `deniedResponseMessage` | `string` | `"Access Denied"` | Message to return for denied requests. |
+| `deniedStatusCode` | `int` | `404` | HTTP status code to return for denied requests. |
+| `deniedResponseMessage` | `string` | `"Not Found"` | Message to return for denied requests. |
 | `redirectURL` | `string` | `""` | URL to redirect to for denied requests. Overrides `deniedStatusCode` and `deniedResponseMessage`. |
-| `addCountryCodeHeader` | `boolean` | `false` | Add `X-Country-Code` header to the request. |
-| `addRegionCodeHeader` | `boolean` | `false` | Add `X-Region-Code` header to the request. |
-| `addCityNameHeader` | `boolean` | `false` | Add `X-City-Name` header to the request. |
 | `excludedPaths` | `[]string` | `[]` | A list of regular expression patterns for paths that should be excluded from geo-access control checks. |
 | `logAllowedAccess` | `boolean` | `false` | Log allowed requests. |
 | `logDeniedAccess` | `boolean` | `false` | Log blocked requests. |
@@ -134,7 +126,6 @@ http:
 | `logPrivateIPAccess` | `boolean` | `false` | Log requests from private IP ranges. |
 | `logLevel` | `string` | `"info"` | Log level: `debug`, `info`, `warn`, or `error`. |
 | `logFilePath` | `string` | `""` | Path to save logs to file. If empty, logs only output to Traefik. Can be used for fail2ban integration. |
-| `suppressStartupLogs` | `boolean` | `false` | Suppress startup logs. |
 
 ## Logging and fail2ban Integration
 

@@ -8,14 +8,17 @@ import (
 
 func TestCreateConfig(t *testing.T) {
 	config := CreateConfig()
-	if config.API != "http://geoip-api:8080/country/{ip}" {
-		t.Errorf("Expected default API, got %s", config.API)
+	if config.GeoAPIEndpoint != "http://geoip-api:8080/country/{ip}" {
+		t.Errorf("Expected default API, got %s", config.GeoAPIEndpoint)
 	}
 	if config.CacheSize != 100 {
 		t.Errorf("Expected default cacheSize to be 100, got %d", config.CacheSize)
 	}
-	if config.DeniedHTTPStatusCode != http.StatusForbidden {
-		t.Errorf("Expected default status code to be 403, got %d", config.DeniedHTTPStatusCode)
+	if config.DeniedStatusCode != http.StatusNotFound {
+		t.Errorf("Expected default status code to be 404, got %d", config.DeniedStatusCode)
+	}
+	if config.DeniedResponseMessage != "Not Found" {
+		t.Errorf("Expected default denied message to be 'Not Found', got %s", config.DeniedResponseMessage)
 	}
 }
 
@@ -29,8 +32,8 @@ func TestNew(t *testing.T) {
 		{
 			name: "valid config",
 			config: &Config{
-				API: "http://test/country/{ip}",
-				AllowedLists: map[string]interface{}{
+				GeoAPIEndpoint: "http://test/country/{ip}",
+				AccessRules: map[string]interface{}{
 					"US": true,
 				},
 			},
@@ -39,7 +42,7 @@ func TestNew(t *testing.T) {
 		{
 			name: "missing API",
 			config: &Config{
-				AllowedLists: map[string]interface{}{
+				AccessRules: map[string]interface{}{
 					"US": true,
 				},
 			},
@@ -48,8 +51,8 @@ func TestNew(t *testing.T) {
 		{
 			name: "no rules",
 			config: &Config{
-				API:          "http://test/country/{ip}",
-				AllowedLists: make(map[string]interface{}),
+				GeoAPIEndpoint: "http://test/country/{ip}",
+				AccessRules:    make(map[string]interface{}),
 			},
 			wantErr: true,
 		},
@@ -67,8 +70,8 @@ func TestNew(t *testing.T) {
 
 func TestAccess(t *testing.T) {
 	config := &Config{
-		API: "http://test-api",
-		AllowedLists: map[string]interface{}{
+		GeoAPIEndpoint: "http://test-api",
+		AccessRules: map[string]interface{}{
 			// IP Rules
 			"1.1.1.1":    false,
 			"8.8.0.0/16": true,

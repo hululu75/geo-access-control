@@ -39,9 +39,6 @@ type Config struct {
 	DeniedStatusCode      int                    `json:"deniedHTTPStatusCode,omitempty"`
 	DeniedResponseMessage string                 `json:"deniedMessage,omitempty"`
 	RedirectURL           string                 `json:"redirectURL,omitempty"`
-	AddCountryCodeHeader  bool                   `json:"addCountryHeader,omitempty"`
-	AddRegionCodeHeader   bool                   `json:"addRegionHeader,omitempty"`
-	AddCityNameHeader     bool                   `json:"addCityHeader,omitempty"`
 	ExcludedPaths         []string               `json:"excludedPathPatterns,omitempty"`
 	LogAllowedAccess      bool                   `json:"logAllowedRequests,omitempty"`
 	LogDeniedAccess       bool                   `json:"logBlockedRequests,omitempty"`
@@ -61,8 +58,8 @@ func CreateConfig() *Config {
 		AllowPrivateIPAccess:    true,
 		AllowRequestsWithoutGeoData: false,
 		CacheSize:             100,
-		DeniedStatusCode:      http.StatusForbidden,
-		DeniedResponseMessage:         "Access Denied",
+		DeniedStatusCode:      http.StatusNotFound,
+		DeniedResponseMessage:         "Not Found",
 		LogLevel:              "info", // Default log level
 		LogFilePath:           "",     // Default empty log file path
 	}
@@ -260,16 +257,6 @@ func (g *GeoAccessControl) ServeHTTP(rw http.ResponseWriter, req *http.Request) 
 			g.denyRequest(rw, req, "Could not determine location")
 		}
 		return
-	}
-
-	if g.config.AddCountryCodeHeader && geoData.Country != "" {
-		req.Header.Set("X-Country-Code", geoData.Country)
-	}
-	if g.config.AddRegionCodeHeader && geoData.Region != "" {
-		req.Header.Set("X-Region-Code", geoData.Region)
-	}
-	if g.config.AddCityNameHeader && geoData.City != "" {
-		req.Header.Set("X-City-Name", geoData.City)
 	}
 
 	if g.checkGeoAccess(geoData) {
