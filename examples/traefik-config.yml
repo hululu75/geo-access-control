@@ -4,110 +4,72 @@
 experimental:
   localPlugins:
     geo-access-control:
-      moduleName: github.com/yourusername/geo-access-control
+      moduleName: github.com/hululu75/geo-access-control
 
 # Dynamic Configuration (config.yml)
 http:
   middlewares:
-    # Example 1: Allow only specific countries
-    geo-allow-countries:
+    # Example 1: Basic allow/deny
+    geo-simple:
       plugin:
         geo-access-control:
           api: "http://geoip-api:8080/country/{ip}"
-          allowedCountries:
-            - US
-            - CA
-            - GB
+          allowedLists:
+            US: true  # Allow US
+            CA: true  # Allow Canada
+            KP: false # Deny North Korea
 
-    # Example 2: Block specific countries (blacklist)
-    geo-block-countries:
+    # Example 2: IP-based rules
+    ip-rules:
       plugin:
         geo-access-control:
           api: "http://geoip-api:8080/country/{ip}"
-          blackListMode: true
-          allowedCountries:
-            - CN
-            - RU
+          allowedLists:
+            "1.1.1.1": false # Deny a specific IP
+            "8.8.0.0/16": true # Allow a CIDR range
 
-    # Example 3: Region-level filtering
-    geo-allow-regions:
+    # Example 3: Complex hierarchical rules
+    geo-complex:
       plugin:
         geo-access-control:
           api: "http://geoip-api:8080/country/{ip}"
-          allowedRegions:
-            - US-CA
-            - US-NY
-            - CN-44
+          allowedLists:
+            # IP rules take precedence
+            "10.0.0.0/8": false
 
-    # Example 4: City-level filtering
-    geo-allow-cities:
-      plugin:
-        geo-access-control:
-          api: "http://geoip-api:8080/country/{ip}"
-          allowedCities:
-            - "US|New York"
-            - "US|Los Angeles"
-            - "GB|London"
+            # Geo Rules
+            US: true # Allow all of US
+            GB:
+              regions:
+                SCO: false # Deny Scotland
+                ENG:
+                  cities:
+                    - London # Allow London
+            CN:
+              regions:
+                HK: false # Deny Hong Kong
 
-    # Example 5: Priority-based multi-level filtering (NEW!)
-    # Different filtering levels for different countries
-    geo-priority-based:
-      plugin:
-        geo-access-control:
-          api: "http://geoip-api:8080/country/{ip}"
-          # Allow ALL traffic from US and France (no restrictions)
-          allowedCountries:
-            - US
-            - FR
-          # For China: ONLY allow specific regions (ignores country rule)
-          allowedRegions:
-            - CN-44        # Guangdong Province
-            - CN-31        # Shanghai
-          # For UK: ONLY allow specific cities (ignores country rule)
-          allowedCities:
-            - "GB|London"
-            - "GB|Manchester"
-          # Result:
-          # - US (any city) -> Allowed
-          # - France (any city) -> Allowed
-          # - China, Guangdong -> Allowed
-          # - China, Beijing -> DENIED (CN has region rules)
-          # - UK, London -> Allowed
-          # - UK, Birmingham -> DENIED (GB has city rules)
-
-    # Example 6: Full configuration
+    # Example 4: Full configuration
     geo-full:
       plugin:
         geo-access-control:
           api: "http://geoip-api:8080/country/{ip}"
           apiTimeoutMs: 1000
-          allowedCountries:
-            - US
-            - CA
-          allowedRegions:
-            - CN-44
-          allowedIPs:
-            - "192.168.1.0/24"
-            - "10.0.0.5"
+          allowedLists:
+            "1.2.3.4": true
+            US: true
+            KP: false
           allowLocalRequests: true
           allowUnknownCountries: false
-          cacheSize: 200
           deniedHTTPStatusCode: 403
-          deniedMessage: "Access denied from your location"
-          addCountryHeader: true
-          addRegionHeader: true
-          excludedPathPatterns:
-            - "^/health$"
-            - "^/api/public/.*"
-          logBlockedRequests: true
-          logAllowedRequests: false
+          # ... other options
 
   routers:
     my-app:
       rule: "Host(`myapp.example.com`)"
       service: my-app-service
       middlewares:
-        - geo-allow-countries
+        - geo-complex
 
   services:
     my-app-service:
