@@ -1,0 +1,116 @@
+# Example Traefik Configuration with Geo Access Control
+
+# Static Configuration (traefik.yml)
+experimental:
+  localPlugins:
+    geo-access-control:
+      moduleName: github.com/yourusername/geo-access-control
+
+# Dynamic Configuration (config.yml)
+http:
+  middlewares:
+    # Example 1: Allow only specific countries
+    geo-allow-countries:
+      plugin:
+        geo-access-control:
+          api: "http://geoip-api:8080/country/{ip}"
+          allowedCountries:
+            - US
+            - CA
+            - GB
+
+    # Example 2: Block specific countries (blacklist)
+    geo-block-countries:
+      plugin:
+        geo-access-control:
+          api: "http://geoip-api:8080/country/{ip}"
+          blackListMode: true
+          allowedCountries:
+            - CN
+            - RU
+
+    # Example 3: Region-level filtering
+    geo-allow-regions:
+      plugin:
+        geo-access-control:
+          api: "http://geoip-api:8080/country/{ip}"
+          allowedRegions:
+            - US-CA
+            - US-NY
+            - CN-44
+
+    # Example 4: City-level filtering
+    geo-allow-cities:
+      plugin:
+        geo-access-control:
+          api: "http://geoip-api:8080/country/{ip}"
+          allowedCities:
+            - "US|New York"
+            - "US|Los Angeles"
+            - "GB|London"
+
+    # Example 5: Priority-based multi-level filtering (NEW!)
+    # Different filtering levels for different countries
+    geo-priority-based:
+      plugin:
+        geo-access-control:
+          api: "http://geoip-api:8080/country/{ip}"
+          # Allow ALL traffic from US and France (no restrictions)
+          allowedCountries:
+            - US
+            - FR
+          # For China: ONLY allow specific regions (ignores country rule)
+          allowedRegions:
+            - CN-44        # Guangdong Province
+            - CN-31        # Shanghai
+          # For UK: ONLY allow specific cities (ignores country rule)
+          allowedCities:
+            - "GB|London"
+            - "GB|Manchester"
+          # Result:
+          # - US (any city) -> Allowed
+          # - France (any city) -> Allowed
+          # - China, Guangdong -> Allowed
+          # - China, Beijing -> DENIED (CN has region rules)
+          # - UK, London -> Allowed
+          # - UK, Birmingham -> DENIED (GB has city rules)
+
+    # Example 6: Full configuration
+    geo-full:
+      plugin:
+        geo-access-control:
+          api: "http://geoip-api:8080/country/{ip}"
+          apiTimeoutMs: 1000
+          allowedCountries:
+            - US
+            - CA
+          allowedRegions:
+            - CN-44
+          allowedIPs:
+            - "192.168.1.0/24"
+            - "10.0.0.5"
+          allowLocalRequests: true
+          allowUnknownCountries: false
+          cacheSize: 200
+          deniedHTTPStatusCode: 403
+          deniedMessage: "Access denied from your location"
+          addCountryHeader: true
+          addRegionHeader: true
+          excludedPathPatterns:
+            - "^/health$"
+            - "^/api/public/.*"
+          logBlockedRequests: true
+          logAllowedRequests: false
+
+  routers:
+    my-app:
+      rule: "Host(`myapp.example.com`)"
+      service: my-app-service
+      middlewares:
+        - geo-allow-countries
+
+  services:
+    my-app-service:
+      loadBalancer:
+        servers:
+          - url: "http://localhost:8000"
