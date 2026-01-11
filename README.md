@@ -16,6 +16,210 @@ A Traefik middleware plugin for controlling access based on geographic location 
 - **Private IP handling**: Optionally bypass filtering for local requests.
 - **Comprehensive logging**: Detailed logging options for debugging and monitoring.
 
+## Recommended Setup with geoip-api
+
+This plugin is designed to work seamlessly with [geoip-api](https://github.com/hululu75/geoip-api), a lightweight, self-hosted GeoIP lookup service.
+
+### Complete Docker Compose Setup
+
+Here's a complete example running Traefik, geoip-api, and your application together:
+
+```yaml
+version: '3.8'
+
+services:
+  # GeoIP API Service
+  geoip-api:
+    image: hululu75/geoip-api:latest
+    container_name: geoip-api
+    environment:
+      - MAXMIND_LICENSE_KEY=your_maxmind_license_key_here  # Get free key from https://www.maxmind.com/en/geolite2/signup
+      - PORT=8080
+      - DB_UPDATE_INTERVAL_HOURS=720  # Update every 30 days
+      - LOG_LEVEL=INFO
+    volumes:
+      - geoip-data:/app/data  # Persist database across restarts
+    networks:
+      - traefik-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Traefik Reverse Proxy
+  traefik:
+    image: traefik:v3.0
+    container_name: traefik
+    command:
+      - --api.insecure=true
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --entrypoints.web.address=:80
+      - --entrypoints.websecure.address=:443
+      - --experimental.localPlugins.geo-access-control.moduleName=github.com/hululu75/geo-access-control
+    ports:
+      - "80:80"
+      - "443:443"
+      - "8080:8080"  # Traefik dashboard
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./plugins-local:/plugins-local  # Local plugins directory
+      - ./traefik-config.yml:/etc/traefik/dynamic/config.yml:ro
+    networks:
+      - traefik-network
+    depends_on:
+      geoip-api:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Your Application (Example)
+  myapp:
+    image: nginx:alpine
+    container_name: myapp
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.myapp.rule=Host(`example.com`)"
+      - "traefik.http.routers.myapp.entrypoints=websecure"
+      - "traefik.http.routers.myapp.middlewares=geo-filter@file"
+    networks:
+      - traefik-network
+    restart: unless-stopped
+
+networks:
+  traefik-network:
+    driver: bridge
+
+volumes:
+  geoip-data:
+```
+
+### Step-by-Step Setup Guide
+
+1. **Get a MaxMind License Key (Free)**
+
+   - Sign up at https://www.maxmind.com/en/geolite2/signup
+   - Generate a license key from your account dashboard
+   - Copy the key for use in the docker-compose configuration
+
+2. **Prepare the Plugin Directory Structure**
+
+   ```bash
+   mkdir -p plugins-local/src/github.com/hululu75
+   cd plugins-local/src/github.com/hululu75
+   git clone https://github.com/hululu75/geo-access-control.git
+   cd ../../..
+   ```
+
+3. **Create Traefik Dynamic Configuration**
+
+   Create `traefik-config.yml` with your geo-access rules:
+
+   ```yaml
+   http:
+     middlewares:
+       geo-filter:
+         plugin:
+           geo-access-control:
+             # Point to the geoip-api service
+             geoAPIEndpoint: "http://geoip-api:8080/city/{ip}"
+             geoAPITimeoutMilliseconds: 500
+             geoAPIResponseIsJSON: false  # geoip-api returns text by default (US|City|Region)
+
+             # Access rules
+             accessRules:
+               # Allow US and Canada
+               US: true
+               CA: true
+
+               # Deny specific countries
+               CN: false
+               RU: false
+
+               # UK with regional rules
+               GB:
+                 regions:
+                   ENG: true    # Allow England
+                   SCO: false   # Deny Scotland
+
+             # Plugin settings
+             allowPrivateIPAccess: true
+             allowRequestsWithoutGeoData: false
+             cacheSize: 1000
+             deniedStatusCode: 403
+             deniedResponseMessage: "Access denied from your location"
+
+             # Logging
+             logDeniedAccess: true
+             logLevel: "info"
+   ```
+
+4. **Update docker-compose.yml**
+
+   - Replace `your_maxmind_license_key_here` with your actual MaxMind license key
+   - Update `Host(\`example.com\`)` with your actual domain
+
+5. **Launch the Services**
+
+   ```bash
+   docker-compose up -d
+   ```
+
+6. **Verify Setup**
+
+   Test the geoip-api service:
+   ```bash
+   # Test country lookup
+   curl http://localhost:8080/country/8.8.8.8
+   # Returns: US
+
+   # Test city lookup (default format for this plugin)
+   curl http://localhost:8080/city/8.8.8.8
+   # Returns: US|Mountain View|CA
+
+   # Test with JSON format
+   curl http://localhost:8080/city/8.8.8.8?format=json
+   # Returns: {"ip":"8.8.8.8","country":"US","city":"Mountain View","region":"CA"}
+   ```
+
+### Alternative API Endpoint Formats
+
+The geoip-api provides different endpoints based on granularity needs:
+
+```yaml
+# For country-level filtering only (fastest)
+geoAPIEndpoint: "http://geoip-api:8080/country/{ip}"
+geoAPIResponseIsJSON: false  # Returns: US
+
+# For country + region filtering
+geoAPIEndpoint: "http://geoip-api:8080/region/{ip}"
+geoAPIResponseIsJSON: false  # Returns: US|CA
+
+# For full city-level filtering (recommended)
+geoAPIEndpoint: "http://geoip-api:8080/city/{ip}"
+geoAPIResponseIsJSON: false  # Returns: US|Mountain View|CA
+
+# Using JSON format (add ?format=json to any endpoint)
+geoAPIEndpoint: "http://geoip-api:8080/city/{ip}?format=json"
+geoAPIResponseIsJSON: true   # Returns: {"ip":"...","country":"...","city":"...","region":"..."}
+```
+
+**Recommendation**: Use `/city/{ip}` endpoint for maximum flexibility, even if you only configure country-level rules. This allows you to add city/region rules later without changing the API endpoint.
+
+### Using External GeoIP Services
+
+While geoip-api is recommended, you can use any GeoIP service that returns location data:
+
+```yaml
+# Example with a hypothetical external service
+geoAPIEndpoint: "https://external-geoip.example.com/lookup?ip={ip}"
+geoAPIResponseIsJSON: true
+geoAPITimeoutMilliseconds: 1000  # Increase timeout for external services
+```
+
+Ensure the response format matches your `geoAPIResponseIsJSON` setting.
+
 ## Installation
 
 This plugin uses Traefik's `localPlugins` feature. Follow these steps to install:
