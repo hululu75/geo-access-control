@@ -112,8 +112,9 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 	}
 
 	pluginLogger := &PluginLogger{
-		logger: log.New(logWriter, fmt.Sprintf("[%s] ", name), log.Ldate|log.Ltime|log.Lshortfile),
+		logger: log.New(logWriter, "", log.Ldate|log.Ltime),
 		level:  parseLogLevel(config.LogLevel),
+		name:   name,
 	}
 
 	if config.GeoAPIEndpoint == "" {
@@ -562,34 +563,35 @@ func parseLogLevel(level string) LogLevel {
 type PluginLogger struct {
 	logger *log.Logger
 	level  LogLevel
+	name   string
 }
 
 func (l *PluginLogger) Debugf(format string, v ...interface{}) {
 	if l.level <= LevelDebug {
-		l.logger.Printf("[DEBUG] "+format, v...)
+		l.logger.Printf("[%s] [DEBUG] "+format, append([]interface{}{l.name}, v...)...)
 	}
 }
 
 func (l *PluginLogger) Infof(format string, v ...interface{}) {
 	if l.level <= LevelInfo {
-		l.logger.Printf("[INFO] "+format, v...)
+		l.logger.Printf("[%s] [INFO] "+format, append([]interface{}{l.name}, v...)...)
 	}
 }
 
 func (l *PluginLogger) Warnf(format string, v ...interface{}) {
 	if l.level <= LevelWarn {
-		l.logger.Printf("[WARN] "+format, v...)
+		l.logger.Printf("[%s] [WARN] "+format, append([]interface{}{l.name}, v...)...)
 	}
 }
 
 func (l *PluginLogger) Errorf(format string, v ...interface{}) {
 	if l.level <= LevelError {
-		l.logger.Printf("[ERROR] "+format, v...)
+		l.logger.Printf("[%s] [ERROR] "+format, append([]interface{}{l.name}, v...)...)
 	}
 }
 
 func (l *PluginLogger) Fatalf(format string, v ...interface{}) {
-	l.logger.Fatalf("[FATAL] "+format, v...)
+	l.logger.Fatalf("[%s] [FATAL] "+format, append([]interface{}{l.name}, v...)...)
 }
 
 func (l *PluginLogger) Printf(format string, v ...interface{}) {

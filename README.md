@@ -69,6 +69,9 @@ accessRules:
 - A request from Glasgow, Scotland is **Denied** (`SCO: false` region rule applies).
 
 ### Complete Configuration Example
+
+#### YAML Configuration
+
 ```yaml
 http:
   middlewares:
@@ -77,7 +80,7 @@ http:
         geo-access-control:
           geoAPIEndpoint: "http://my-geo-api.com/lookup/{ip}" # Required: URL of your geo IP API. {ip} will be replaced by the client's IP.
           geoAPITimeoutMilliseconds: 500                      # Optional: Timeout for the API request in milliseconds. Default is 750ms.
-          geoAPIResponseIsJSON: true                    # Optional: If your API returns JSON. Default is true.
+          geoAPIResponseIsJSON: true                          # Optional: If your API returns JSON. Default is true.
           accessRules:
             # IP Rules
             "10.0.0.0/8": false
@@ -103,6 +106,42 @@ http:
           logPrivateIPAccess: true
           logLevel: "info"                                    # Optional: Log level. Options: debug, info, warn, error. Default is info.
           logFilePath: "/var/log/traefik/geo-access.log"     # Optional: Save logs to file for fail2ban integration. Default is empty (Traefik logs only).
+```
+
+#### TOML Configuration
+
+```toml
+[http.middlewares]
+  [http.middlewares.geo-full-config.plugin.geo-access-control]
+    geoAPIEndpoint = "http://my-geo-api.com/lookup/{ip}"
+    geoAPITimeoutMilliseconds = 500
+    geoAPIResponseIsJSON = true
+    allowPrivateIPAccess = true
+    allowRequestsWithoutGeoData = false
+    cacheSize = 100
+    deniedStatusCode = 404
+    deniedResponseMessage = "Access Denied!"
+    redirectURL = "https://example.com/denied"
+    excludedPaths = ["/metrics", "/health"]
+    logAllowedAccess = true
+    logDeniedAccess = true
+    logGeoAPICalls = true
+    logPrivateIPAccess = true
+    logLevel = "info"
+    logFilePath = "/var/log/traefik/geo-access.log"
+
+    # Access Rules (IP and Geo Rules)
+    [http.middlewares.geo-full-config.plugin.geo-access-control.accessRules]
+      "10.0.0.0/8" = false
+      "192.168.1.100" = true
+      US = true
+      CA = true
+      KP = false
+
+      # Country with region rules
+      [http.middlewares.geo-full-config.plugin.geo-access-control.accessRules.GB]
+        [http.middlewares.geo-full-config.plugin.geo-access-control.accessRules.GB.regions]
+          SCO = false
 ```
 
 ## Configuration Options
@@ -142,18 +181,25 @@ The plugin supports four log levels via the `logLevel` configuration option:
 - `debug`: Full URL with path → `https://example.com/api/users`
 - `info`/`warn`/`error`: Website name only → `example.com`
 
+**Log Format:**
+
+Logs follow the format:
+```
+YYYY/MM/DD HH:MM:SS [PLUGIN_NAME] [LEVEL] message
+```
+
 **Log Examples:**
 
 Debug level:
 ```
-[geo-access-control] [DEBUG] Processing request from IP: 1.2.3.4 to https://example.com/api/users
-[geo-access-control] [WARN] Denied request from IP: 1.2.3.4 (CN, , ) to https://example.com/api/users by geo rule
+2026/01/11 08:40:32 [geo-access-control] [DEBUG] Processing request from IP: 1.2.3.4 to https://example.com/api/users
+2026/01/11 08:40:32 [geo-access-control] [WARN] Denied request from IP: 1.2.3.4 (CN, , ) to https://example.com/api/users by geo rule
 ```
 
 Info level:
 ```
-[geo-access-control] [INFO] Allowed request from IP: 5.6.7.8 (US, CA, Los Angeles) to example.com by geo rule
-[geo-access-control] [WARN] Denied request from IP: 1.2.3.4 (CN, , ) to example.com by geo rule
+2026/01/11 08:40:32 [geo-access-control] [INFO] Allowed request from IP: 5.6.7.8 (US, CA, Los Angeles) to example.com by geo rule
+2026/01/11 08:40:32 [geo-access-control] [WARN] Denied request from IP: 1.2.3.4 (CN, , ) to example.com by geo rule
 ```
 
 ### Log File Path
@@ -189,7 +235,7 @@ http:
 
 ```ini
 [Definition]
-failregex = ^\[.*\] \[WARN\] Denied request from IP: <HOST> .* to .* by (explicit IP rule|geo rule)$
+failregex = ^\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2} \[.*\] \[WARN\] Denied request from IP: <HOST> .* to .* by (explicit IP rule|geo rule)$
 ignoreregex =
 ```
 
