@@ -385,31 +385,38 @@ func (g *GeoAccessControl) checkGeoAccess(geoData *GeoData) (bool, string) {
 			// Region matches - check city rules if any
 			if geoData.City != "" && len(regionRule.Cities) > 0 {
 				if contains(regionRule.Cities, geoData.City) {
-					return true, fmt.Sprintf("city %s in region %s", geoData.City, geoData.Region)
+					return true, fmt.Sprintf("city %s in region %s, %s", geoData.City, geoData.Region, geoData.Country)
 				}
-				return false, fmt.Sprintf("city %s not in allowed list", geoData.City)
+				return false, fmt.Sprintf("city %s not in allowed list (region %s, %s)", geoData.City, geoData.Region, geoData.Country)
 			}
-			return regionRule.Allowed, fmt.Sprintf("region %s", geoData.Region)
+			return regionRule.Allowed, fmt.Sprintf("region %s, %s", geoData.Region, geoData.Country)
 		}
 		// Has region info but doesn't match any defined regions
 		if hasRegionRules {
-			return false, fmt.Sprintf("region %s not in allowed regions", geoData.Region)
+			return false, fmt.Sprintf("region %s not in allowed regions (%s)", geoData.Region, geoData.Country)
 		}
 	} else if hasRegionRules {
 		// No region info - check if "unknown" region rule exists
 		if unknownRule, exists := countryRule.Regions["unknown"]; exists {
-			return unknownRule.Allowed, "region unknown"
+			return unknownRule.Allowed, fmt.Sprintf("region unknown (%s)", geoData.Country)
 		}
 		// If no "unknown" rule in regions, use country-level 'unknown' field
-		return countryRule.Unknown, "region unknown (country-level)"
+		return countryRule.Unknown, fmt.Sprintf("region unknown (country-level, %s)", geoData.Country)
 	}
 
 	// Fallback to country-level rules
 	if geoData.City != "" && len(countryRule.Cities) > 0 {
 		if contains(countryRule.Cities, geoData.City) {
-			return true, fmt.Sprintf("city %s", geoData.City)
+			// Include region info only if region rules are defined in config
+			if hasRegionRules && geoData.Region != "" {
+				return true, fmt.Sprintf("city %s in region %s, %s", geoData.City, geoData.Region, geoData.Country)
+			}
+			return true, fmt.Sprintf("city %s, %s", geoData.City, geoData.Country)
 		}
-		return false, "city not in allowed list"
+		if hasRegionRules && geoData.Region != "" {
+			return false, fmt.Sprintf("city not in allowed list (region %s, %s)", geoData.Region, geoData.Country)
+		}
+		return false, fmt.Sprintf("city not in allowed list (%s)", geoData.Country)
 	}
 	return countryRule.Allowed, fmt.Sprintf("country %s", geoData.Country)
 }
