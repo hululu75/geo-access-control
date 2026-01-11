@@ -18,7 +18,49 @@ A Traefik middleware plugin for controlling access based on geographic location 
 
 ## Installation
 
-(No changes from before)
+This plugin uses Traefik's `localPlugins` feature. Follow these steps to install:
+
+1. **Clone the plugin to your Traefik plugins directory:**
+
+   ```bash
+   mkdir -p /path/to/traefik/plugins-local/src/github.com/hululu75
+   cd /path/to/traefik/plugins-local/src/github.com/hululu75
+   git clone https://github.com/hululu75/geo-access-control.git
+   ```
+
+2. **Configure Traefik to use local plugins:**
+
+   In your Traefik static configuration (e.g., `traefik.yml` or `traefik.toml`):
+
+   ```yaml
+   experimental:
+     localPlugins:
+       geo-access-control:
+         moduleName: github.com/hululu75/geo-access-control
+   ```
+
+   Or in TOML format:
+
+   ```toml
+   [experimental.localPlugins.geo-access-control]
+     moduleName = "github.com/hululu75/geo-access-control"
+   ```
+
+3. **Mount the plugins directory in Docker (if using Docker):**
+
+   ```yaml
+   services:
+     traefik:
+       image: traefik:latest
+       volumes:
+         - /path/to/traefik/plugins-local:/plugins-local
+       command:
+         - --experimental.localPlugins.geo-access-control.moduleName=github.com/hululu75/geo-access-control
+   ```
+
+4. **Restart Traefik** to load the local plugin.
+
+**Note:** Local plugins are loaded from the `/plugins-local` directory by default. The directory structure must match the module name: `/plugins-local/src/github.com/hululu75/geo-access-control/`.
 
 ## Configuration
 
