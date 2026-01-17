@@ -54,7 +54,7 @@ http:
       plugin:
         geo-access-control:
           geoAPIEndpoint: "http://geoip-api:8080/country/{ip}"
-          geoAPITimeoutMilliseconds: 1000
+          geoAPITimeout: 1000
           geoAPIResponseIsJSON: true
           accessRules:
             "1.2.3.4": true
@@ -71,6 +71,7 @@ http:
           logDeniedAccess: true
           logGeoAPICalls: false
           logPrivateIPAccess: false
+          logWhiteListAccess: false
           logLevel: "info"
           logFilePath: "/var/log/traefik/geo-access.log"
 

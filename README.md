@@ -124,7 +124,7 @@ volumes:
            geo-access-control:
              # Point to the geoip-api service
              geoAPIEndpoint: "http://geoip-api:8080/city/{ip}"
-             geoAPITimeoutMilliseconds: 500
+             geoAPITimeout: 500
              geoAPIResponseIsJSON: false  # geoip-api returns text by default (US|City|Region)
 
              # Access rules
@@ -215,7 +215,7 @@ While geoip-api is recommended, you can use any GeoIP service that returns locat
 # Example with a hypothetical external service
 geoAPIEndpoint: "https://external-geoip.example.com/lookup?ip={ip}"
 geoAPIResponseIsJSON: true
-geoAPITimeoutMilliseconds: 1000  # Increase timeout for external services
+geoAPITimeout: 1000  # Increase timeout for external services
 ```
 
 Ensure the response format matches your `geoAPIResponseIsJSON` setting.
@@ -325,7 +325,7 @@ http:
       plugin:
         geo-access-control:
           geoAPIEndpoint: "http://my-geo-api.com/lookup/{ip}" # Required: URL of your geo IP API. {ip} will be replaced by the client's IP.
-          geoAPITimeoutMilliseconds: 500                      # Optional: Timeout for the API request in milliseconds. Default is 750ms.
+          geoAPITimeout: 500                      # Optional: Timeout for the API request in milliseconds. Default is 750ms.
           geoAPIResponseIsJSON: true                          # Optional: If your API returns JSON. Default is true.
           accessRules:
             # IP Rules
@@ -360,7 +360,7 @@ http:
 [http.middlewares]
   [http.middlewares.geo-full-config.plugin.geo-access-control]
     geoAPIEndpoint = "http://my-geo-api.com/lookup/{ip}"
-    geoAPITimeoutMilliseconds = 500
+    geoAPITimeout = 500
     geoAPIResponseIsJSON = true
     allowPrivateIPAccess = true
     allowRequestsWithoutGeoData = false
@@ -395,7 +395,7 @@ http:
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `geoAPIEndpoint` | `string` | `"http://geoip-api:8080/country/{ip}"` | URL of your geo IP API. `{ip}` will be replaced by the client's IP. |
-| `geoAPITimeoutMilliseconds` | `int` | `750` | Timeout for the API request in milliseconds. |
+| `geoAPITimeout` | `int` | `750` | Timeout for the API request in milliseconds. |
 | `geoAPIResponseIsJSON` | `boolean` | `true` | If your API returns JSON. |
 | `accessRules` | `map[string]interface{}` | `{}` | **Unified map of allow/deny rules.** Keys are country codes or IPs/CIDR. Values are `true` (allow) or `false` (deny), or a map for nested rules. |
 | `allowPrivateIPAccess` | `boolean` | `true` | Allow requests from private IP ranges (e.g., 10.0.0.0/8, 192.168.0.0/16). |
@@ -409,6 +409,7 @@ http:
 | `logDeniedAccess` | `boolean` | `false` | Log blocked requests. |
 | `logGeoAPICalls` | `boolean` | `false` | Log requests to the Geo IP API. |
 | `logPrivateIPAccess` | `boolean` | `false` | Log requests from private IP ranges. |
+| `logWhiteListAccess` | `boolean` | `false` | Log requests allowed by IP whitelist rules. |
 | `logLevel` | `string` | `"info"` | Log level: `debug`, `info`, `warn`, or `error`. |
 | `logFilePath` | `string` | `""` | Path to save logs to file. If empty, logs only output to Traefik. Can be used for fail2ban integration. |
 
