@@ -31,7 +31,7 @@ type CountryRules struct {
 // Config holds the plugin configuration.
 type Config struct {
 	GeoAPIEndpoint        string                 `json:"geoAPIEndpoint,omitempty"`
-	GeoAPITimeout         int                    `json:"geoAPITimeoutMilliseconds,omitempty"`
+	GeoAPITimeout         int                    `json:"geoAPITimeout,omitempty"`
 	GeoAPIResponseIsJSON  bool                   `json:"geoAPIResponseIsJSON,omitempty"`
 	AccessRules           map[string]interface{} `json:"accessRules,omitempty"`
 	AllowPrivateIPAccess  bool                   `json:"allowPrivateIPAccess,omitempty"`
@@ -45,6 +45,7 @@ type Config struct {
 	LogDeniedAccess       bool                   `json:"logDeniedAccess,omitempty"`
 	LogGeoAPICalls        bool                   `json:"logGeoAPICalls,omitempty"`
 	LogPrivateIPAccess    bool                   `json:"logPrivateIPAccess,omitempty"`
+	LogWhiteListAccess    bool                   `json:"logWhiteListAccess,omitempty"`
 	LogLevel              string                 `json:"logLevel,omitempty"`
 	LogFilePath           string                 `json:"logFilePath,omitempty"`
 }
@@ -263,7 +264,7 @@ func (g *GeoAccessControl) ServeHTTP(rw http.ResponseWriter, req *http.Request) 
 
 	if decision, determined := g.checkIPRules(clientIP); determined {
 		if decision {
-			if g.config.LogAllowedAccess {
+			if g.config.LogWhiteListAccess {
 				g.logger.Infof("Allowed request from IP: %s to %s (IP whitelist)", clientIP, g.formatURLForLevel(req, g.logger.level))
 			}
 			g.next.ServeHTTP(rw, req)
