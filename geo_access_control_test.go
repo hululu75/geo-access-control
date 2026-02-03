@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"testing"
+	"time"
 )
 
 func TestCreateConfig(t *testing.T) {
@@ -131,4 +132,77 @@ func TestAccess(t *testing.T) {
 	}
 }
 
-// Other tests like TestParseIPRanges can remain as they are independent helpers.
+func TestCacheTTL(t *testing.T) {
+	// TTL of 50ms for fast testing
+	cache := NewLRUCache(10, 50*time.Millisecond)
+
+	cache.Set("key1", "value1")
+
+	// Should be found immediately
+	val, found := cache.Get("key1")
+	if !found {
+		t.Fatal("Expected key1 to be found in cache")
+	}
+	if val.(string) != "value1" {
+		t.Errorf("Expected value1, got %v", val)
+	}
+
+	// Wait for TTL to expire
+	time.Sleep(60 * time.Millisecond)
+
+	// Should be expired now
+	_, found = cache.Get("key1")
+	if found {
+		t.Error("Expected key1 to be expired")
+	}
+
+	// Expired entry should be removed from cache
+	if cache.Len() != 0 {
+		t.Errorf("Expected cache length 0 after expiry, got %d", cache.Len())
+	}
+}
+
+func TestCacheNoTTL(t *testing.T) {
+	// TTL of 0 means no expiration
+	cache := NewLRUCache(10, 0)
+
+	cache.Set("key1", "value1")
+
+	// Should still be found (no TTL)
+	val, found := cache.Get("key1")
+	if !found {
+		t.Fatal("Expected key1 to be found in cache with no TTL")
+	}
+	if val.(string) != "value1" {
+		t.Errorf("Expected value1, got %v", val)
+	}
+}
+
+func TestCacheTTLRefreshOnUpdate(t *testing.T) {
+	cache := NewLRUCache(10, 80*time.Millisecond)
+
+	cache.Set("key1", "value1")
+
+	// Wait 50ms then update the value
+	time.Sleep(50 * time.Millisecond)
+	cache.Set("key1", "value2")
+
+	// Wait another 50ms (100ms total since first set, 50ms since update)
+	time.Sleep(50 * time.Millisecond)
+
+	// Should still be found because the update reset the TTL
+	val, found := cache.Get("key1")
+	if !found {
+		t.Fatal("Expected key1 to be found after TTL refresh")
+	}
+	if val.(string) != "value2" {
+		t.Errorf("Expected value2, got %v", val)
+	}
+}
+
+func TestCreateConfigCacheTTL(t *testing.T) {
+	config := CreateConfig()
+	if config.CacheTTL != 3600 {
+		t.Errorf("Expected default cacheTTL to be 3600, got %d", config.CacheTTL)
+	}
+}

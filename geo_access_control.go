@@ -37,6 +37,7 @@ type Config struct {
 	AllowPrivateIPAccess  bool                   `json:"allowPrivateIPAccess,omitempty"`
 	AllowRequestsWithoutGeoData bool                   `json:"allowRequestsWithoutGeoData,omitempty"`
 	CacheSize             int                    `json:"cacheSize,omitempty"`
+	CacheTTL              int                    `json:"cacheTTL,omitempty"`
 	DeniedStatusCode      int                    `json:"deniedStatusCode,omitempty"`
 	DeniedResponseMessage string                 `json:"deniedResponseMessage,omitempty"`
 	RedirectURL           string                 `json:"redirectURL,omitempty"`
@@ -60,6 +61,7 @@ func CreateConfig() *Config {
 		AllowPrivateIPAccess:    true,
 		AllowRequestsWithoutGeoData: false,
 		CacheSize:             100,
+		CacheTTL:              3600, // Cache TTL in seconds (0 = no expiration)
 		DeniedStatusCode:      http.StatusNotFound,
 		DeniedResponseMessage:         "Not Found",
 		LogLevel:              "info", // Default log level
@@ -151,7 +153,7 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 		next:   next,
 		name:   name,
 		config: config,
-		cache:  NewLRUCache(config.CacheSize),
+		cache:  NewLRUCache(config.CacheSize, time.Duration(config.CacheTTL)*time.Second),
 		httpClient: &http.Client{
 			Timeout: time.Duration(config.GeoAPITimeout) * time.Millisecond,
 		},
