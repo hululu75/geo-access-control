@@ -3,39 +3,55 @@ package geo_access_control
 import (
 	"container/list"
 	"sync"
+	"time"
 )
 
-// LRUCache is a thread-safe LRU cache
+// LRUCache is a thread-safe LRU cache with optional TTL expiration
 type LRUCache struct {
 	capacity int
+	ttl      time.Duration
 	cache    map[string]*list.Element
 	lruList  *list.List
 	mu       sync.RWMutex
 }
 
 type cacheEntry struct {
-	key   string
-	value interface{}
+	key       string
+	value     interface{}
+	createdAt time.Time
 }
 
-// NewLRUCache creates a new LRU cache with the given capacity
-func NewLRUCache(capacity int) *LRUCache {
+// NewLRUCache creates a new LRU cache with the given capacity and TTL.
+// A TTL of 0 means entries never expire (only evicted by capacity).
+func NewLRUCache(capacity int, ttl time.Duration) *LRUCache {
 	return &LRUCache{
 		capacity: capacity,
+		ttl:      ttl,
 		cache:    make(map[string]*list.Element),
 		lruList:  list.New(),
 	}
 }
 
-// Get retrieves a value from the cache
+// Get retrieves a value from the cache.
+// Returns (nil, false) if the key is not found or the entry has expired.
 func (c *LRUCache) Get(key string) (interface{}, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	if elem, found := c.cache[key]; found {
+		entry := elem.Value.(*cacheEntry)
+
+		// Check TTL expiration
+		if c.ttl > 0 && time.Since(entry.createdAt) > c.ttl {
+			// Entry expired, remove it
+			c.lruList.Remove(elem)
+			delete(c.cache, key)
+			return nil, false
+		}
+
 		// Move to front (most recently used)
 		c.lruList.MoveToFront(elem)
-		return elem.Value.(*cacheEntry).value, true
+		return entry.value, true
 	}
 
 	return nil, false
@@ -48,14 +64,16 @@ func (c *LRUCache) Set(key string, value interface{}) {
 
 	// Check if key already exists
 	if elem, found := c.cache[key]; found {
-		// Update value and move to front
+		// Update value, reset timestamp, and move to front
 		c.lruList.MoveToFront(elem)
-		elem.Value.(*cacheEntry).value = value
+		entry := elem.Value.(*cacheEntry)
+		entry.value = value
+		entry.createdAt = time.Now()
 		return
 	}
 
 	// Add new entry
-	entry := &cacheEntry{key: key, value: value}
+	entry := &cacheEntry{key: key, value: value, createdAt: time.Now()}
 	elem := c.lruList.PushFront(entry)
 	c.cache[key] = elem
 

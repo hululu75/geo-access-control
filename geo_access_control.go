@@ -37,6 +37,7 @@ type Config struct {
 	AllowPrivateIPAccess  bool                   `json:"allowPrivateIPAccess,omitempty"`
 	AllowRequestsWithoutGeoData bool                   `json:"allowRequestsWithoutGeoData,omitempty"`
 	CacheSize             int                    `json:"cacheSize,omitempty"`
+	CacheTTL              int                    `json:"cacheTTL,omitempty"`
 	DeniedStatusCode      int                    `json:"deniedStatusCode,omitempty"`
 	DeniedResponseMessage string                 `json:"deniedResponseMessage,omitempty"`
 	RedirectURL           string                 `json:"redirectURL,omitempty"`
@@ -60,6 +61,7 @@ func CreateConfig() *Config {
 		AllowPrivateIPAccess:    true,
 		AllowRequestsWithoutGeoData: false,
 		CacheSize:             100,
+		CacheTTL:              3600, // Cache TTL in seconds (0 = no expiration)
 		DeniedStatusCode:      http.StatusNotFound,
 		DeniedResponseMessage:         "Not Found",
 		LogLevel:              "info", // Default log level
@@ -76,10 +78,18 @@ type GeoAccessControl struct {
 	cache               *LRUCache
 	excludedPathRegexps []*regexp.Regexp
 	privateIPRanges     []*net.IPNet
+	ipRules             []ipRule
 	allowedIPs          []*net.IPNet
 	deniedIPs           []*net.IPNet
 	httpClient          *http.Client
 	logger              *PluginLogger
+	logFile             *os.File
+}
+
+// ipRule associates an IP range with an allow/deny decision.
+type ipRule struct {
+	ipNet   *net.IPNet
+	allowed bool
 }
 
 // GeoData holds geolocation information from API.
@@ -101,14 +111,13 @@ type APIResponse struct {
 func New(ctx context.Context, next http.Handler, config *Config, name string) (http.Handler, error) {
 	// Setup logging
 	var logWriter io.Writer = os.Stderr
+	var logFile *os.File
 	if config.LogFilePath != "" {
-		logFile, err := os.OpenFile(config.LogFilePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+		var err error
+		logFile, err = os.OpenFile(config.LogFilePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 		if err != nil {
 			return nil, fmt.Errorf("failed to open log file: %w", err)
 		}
-		// TODO: Add a way to close the log file when the plugin is stopped.
-		// For Traefik plugins, there isn't a direct "shutdown" hook, so this might be tricky.
-		// For now, it will remain open for the lifetime of the plugin.
 		logWriter = io.MultiWriter(os.Stderr, logFile)
 	}
 
@@ -120,18 +129,43 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 
 	if config.GeoAPIEndpoint == "" {
 		pluginLogger.Errorf("API endpoint is required")
+		if logFile != nil {
+			logFile.Close()
+		}
 		return nil, fmt.Errorf("API endpoint is required")
+	}
+
+	// Validate and apply safe defaults for critical config values
+	if config.CacheSize <= 0 {
+		pluginLogger.Warnf("cacheSize %d is invalid, defaulting to 100", config.CacheSize)
+		config.CacheSize = 100
+	}
+	if config.GeoAPITimeout <= 0 {
+		pluginLogger.Warnf("geoAPITimeout %d is invalid, defaulting to 750ms", config.GeoAPITimeout)
+		config.GeoAPITimeout = 750
+	}
+	if config.DeniedStatusCode < 100 || config.DeniedStatusCode > 599 {
+		pluginLogger.Warnf("deniedStatusCode %d is invalid, defaulting to 404", config.DeniedStatusCode)
+		config.DeniedStatusCode = http.StatusNotFound
 	}
 
 	plugin := &GeoAccessControl{
 		next:   next,
 		name:   name,
 		config: config,
-		cache:  NewLRUCache(config.CacheSize),
+		cache:  NewLRUCache(config.CacheSize, time.Duration(config.CacheTTL)*time.Second),
 		httpClient: &http.Client{
 			Timeout: time.Duration(config.GeoAPITimeout) * time.Millisecond,
 		},
-		logger: pluginLogger,
+		logger:  pluginLogger,
+		logFile: logFile,
+	}
+
+	// closeOnError cleans up resources if New() fails after this point
+	closeOnError := func() {
+		if logFile != nil {
+			logFile.Close()
+		}
 	}
 
 	plugin.allowedRules = make(map[string]CountryRules)
@@ -225,8 +259,20 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 		}
 	}
 
+	// Compile excluded path regexps
+	for _, pattern := range config.ExcludedPaths {
+		re, err := regexp.Compile(pattern)
+		if err != nil {
+			plugin.logger.Errorf("failed to compile excluded path pattern %q: %v", pattern, err)
+			closeOnError()
+			return nil, fmt.Errorf("failed to compile excluded path pattern %q: %w", pattern, err)
+		}
+		plugin.excludedPathRegexps = append(plugin.excludedPathRegexps, re)
+	}
+
 	if len(plugin.allowedRules) == 0 && len(allowedIPStrings) == 0 && len(deniedIPStrings) == 0 {
 		plugin.logger.Errorf("at least one rule must be specified in 'accessRules'")
+		closeOnError()
 		return nil, fmt.Errorf("at least one rule must be specified in 'accessRules'")
 	}
 
@@ -236,19 +282,41 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 	if len(allowedIPStrings) > 0 {
 		plugin.allowedIPs, err = parseIPRanges(allowedIPStrings)
 		if err != nil {
-			plugin.logger.Errorf("failed to parse allowed IPs: %w", err)
+			plugin.logger.Errorf("failed to parse allowed IPs: %v", err)
+			closeOnError()
 			return nil, fmt.Errorf("failed to parse allowed IPs: %w", err)
 		}
 	}
 	if len(deniedIPStrings) > 0 {
 		plugin.deniedIPs, err = parseIPRanges(deniedIPStrings)
 		if err != nil {
-			plugin.logger.Errorf("failed to parse denied IPs: %w", err)
+			plugin.logger.Errorf("failed to parse denied IPs: %v", err)
+			closeOnError()
 			return nil, fmt.Errorf("failed to parse denied IPs: %w", err)
 		}
 	}
 
+	// Build combined IP rules list for most-specific-wins matching
+	for _, ipNet := range plugin.allowedIPs {
+		plugin.ipRules = append(plugin.ipRules, ipRule{ipNet: ipNet, allowed: true})
+	}
+	for _, ipNet := range plugin.deniedIPs {
+		plugin.ipRules = append(plugin.ipRules, ipRule{ipNet: ipNet, allowed: false})
+	}
+
 	return plugin, nil
+}
+
+// Close releases resources held by the plugin (log file, HTTP connections).
+// Should be called when the plugin is being stopped or replaced.
+func (g *GeoAccessControl) Close() error {
+	if g.httpClient != nil {
+		g.httpClient.CloseIdleConnections()
+	}
+	if g.logFile != nil {
+		return g.logFile.Close()
+	}
+	return nil
 }
 
 // ServeHTTP implements the http.Handler interface.
@@ -261,6 +329,15 @@ func (g *GeoAccessControl) ServeHTTP(rw http.ResponseWriter, req *http.Request) 
 	}
 
 	g.logger.Debugf("Processing request from IP: %s to %s", clientIP, g.formatURL(req))
+
+	// Check excluded paths
+	for _, re := range g.excludedPathRegexps {
+		if re.MatchString(req.URL.Path) {
+			g.logger.Debugf("Path %s matched excluded pattern %s, bypassing geo access control", req.URL.Path, re.String())
+			g.next.ServeHTTP(rw, req)
+			return
+		}
+	}
 
 	if decision, determined := g.checkIPRules(clientIP); determined {
 		if decision {
@@ -348,27 +425,37 @@ func (g *GeoAccessControl) isPrivateIP(ipStr string) bool {
 }
 
 // checkIPRules checks if an IP is explicitly allowed or denied.
+// Uses most-specific-wins logic: the rule with the longest prefix match takes precedence.
 func (g *GeoAccessControl) checkIPRules(ipStr string) (decision bool, determined bool) {
 	ip := net.ParseIP(ipStr)
 	if ip == nil {
 		return false, false
 	}
-	for _, deniedRange := range g.deniedIPs {
-		if deniedRange.Contains(ip) {
-			return false, true // Explicitly denied
+
+	bestPrefixLen := -1
+	bestDecision := false
+	matched := false
+
+	for _, rule := range g.ipRules {
+		if rule.ipNet.Contains(ip) {
+			prefixLen, _ := rule.ipNet.Mask.Size()
+			if prefixLen > bestPrefixLen {
+				bestPrefixLen = prefixLen
+				bestDecision = rule.allowed
+				matched = true
+			}
 		}
 	}
-	for _, allowedRange := range g.allowedIPs {
-		if allowedRange.Contains(ip) {
-			return true, true // Explicitly allowed
-		}
-	}
-	return false, false // No IP rule matched
+
+	return bestDecision, matched
 }
 
 // checkGeoAccess determines if access should be allowed based on geo data and hierarchical rules.
 // Returns (allowed bool, matchedRule string)
 func (g *GeoAccessControl) checkGeoAccess(geoData *GeoData) (bool, string) {
+	if geoData == nil {
+		return false, "no geo data"
+	}
 	if geoData.Country == "" {
 		return false, "no country data"
 	}
@@ -425,8 +512,11 @@ func (g *GeoAccessControl) checkGeoAccess(geoData *GeoData) (bool, string) {
 // getGeoData retrieves geolocation data for an IP.
 func (g *GeoAccessControl) getGeoData(ip string) (*GeoData, error) {
 	if cached, found := g.cache.Get(ip); found {
-		g.logger.Debugf("Geo data for IP %s found in cache", ip)
-		return cached.(*GeoData), nil
+		if geoData, ok := cached.(*GeoData); ok {
+			g.logger.Debugf("Geo data for IP %s found in cache", ip)
+			return geoData, nil
+		}
+		g.logger.Warnf("Cache contained invalid type for IP %s, refetching", ip)
 	}
 	
 	apiURL := strings.ReplaceAll(g.config.GeoAPIEndpoint, "{ip}", ip)
@@ -453,7 +543,17 @@ func (g *GeoAccessControl) getGeoData(ip string) (*GeoData, error) {
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
+	// Limit response body to 1MB to prevent memory abuse
+	const maxBodySize = 1 << 20
+
+	if resp.StatusCode != http.StatusOK {
+		// Drain body so the underlying TCP connection can be reused
+		io.Copy(io.Discard, io.LimitReader(resp.Body, maxBodySize))
+		g.logger.Errorf("GeoAPI returned non-200 status %d from %s for IP %s", resp.StatusCode, apiURL, ip)
+		return nil, fmt.Errorf("GeoAPI returned status %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBodySize))
 	if err != nil {
 		g.logger.Errorf("Failed to read GeoAPI response body from %s for IP %s: %v", apiURL, ip, err)
 		return nil, err

@@ -7,10 +7,10 @@ A Traefik middleware plugin for controlling access based on geographic location 
 - **Unified & Hierarchical Configuration**: Define allow/deny rules for countries, regions, cities, and IPs in a single, intuitive structure.
 - **"Most Specific Rule Wins" Logic**: Granular control with predictable behavior.
 - **Expressive Rules**: Use `true` for "allow" and `false` for "deny" at any level of the hierarchy.
-- **IP-Based Rules**: Explicitly allow or deny individual IPs or CIDR ranges, with IP rules taking precedence over geo-rules.
+- **IP-Based Rules**: Explicitly allow or deny individual IPs or CIDR ranges, with IP rules taking precedence over geo-rules. Uses "most specific wins" logic (longest prefix match).
 - **JSON and text format support**: Automatic parsing of both JSON and text API responses.
 - **Integration with geoip-api**: Optimized for use with your self-hosted GeoIP API.
-- **LRU caching**: Fast IP lookups with configurable cache size.
+- **LRU caching with TTL**: Fast IP lookups with configurable cache size and time-based expiration.
 - **Path exclusion**: Exclude specific paths from filtering (regex support).
 - **Custom responses**: Configurable HTTP status codes, messages, or redirects.
 - **Private IP handling**: Optionally bypass filtering for local requests.
@@ -147,6 +147,7 @@ volumes:
              allowPrivateIPAccess: true
              allowRequestsWithoutGeoData: false
              cacheSize: 1000
+             cacheTTL: 3600
              deniedStatusCode: 403
              deniedResponseMessage: "Access denied from your location"
 
@@ -275,7 +276,7 @@ The plugin uses a powerful, unified configuration for both geo-based and IP-base
 The `accessRules` field is a map where keys can be a country code, an IP address, or a CIDR range. The value for each key determines the action: `true` to allow, `false` to deny.
 
 The filtering logic follows a strict order of precedence:
-1.  **IP Rules**: If the request's IP matches an IP or CIDR rule, that rule is final. An IP deny (`false`) will block the request, and an IP allow (`true`) will permit it, overriding any geo-rules.
+1.  **IP Rules (Most Specific Wins)**: If the request's IP matches an IP or CIDR rule, that rule is final, overriding any geo-rules. When multiple IP rules match (e.g., a `/16` deny and a `/32` allow), the most specific rule (longest prefix) wins.
 2.  **Geo Rules ("Most Specific Wins"):** If no IP rule matches, the plugin evaluates geo-rules:
     *   A **City** rule overrides its **Region**.
     *   A **Region** rule overrides its **Country**.
@@ -342,6 +343,7 @@ http:
           allowPrivateIPAccess: true
           allowRequestsWithoutGeoData: false
           cacheSize: 100
+          cacheTTL: 3600
           deniedStatusCode: 404
           deniedResponseMessage: "Access Denied!"
           redirectURL: "https://example.com/denied"
@@ -365,6 +367,7 @@ http:
     allowPrivateIPAccess = true
     allowRequestsWithoutGeoData = false
     cacheSize = 100
+    cacheTTL = 3600
     deniedStatusCode = 404
     deniedResponseMessage = "Access Denied!"
     redirectURL = "https://example.com/denied"
@@ -401,6 +404,7 @@ http:
 | `allowPrivateIPAccess` | `boolean` | `true` | Allow requests from private IP ranges (e.g., 10.0.0.0/8, 192.168.0.0/16). |
 | `allowRequestsWithoutGeoData` | `boolean` | `false` | Allow requests if the geographic data cannot be determined by the API. |
 | `cacheSize` | `int` | `100` | Size of the LRU cache for geo IP lookups. |
+| `cacheTTL` | `int` | `3600` | Cache entry time-to-live in seconds. Expired entries are automatically removed on access and re-fetched from the GeoIP API. Set to `0` to disable TTL (entries only evicted by capacity). |
 | `deniedStatusCode` | `int` | `404` | HTTP status code to return for denied requests. |
 | `deniedResponseMessage` | `string` | `"Not Found"` | Message to return for denied requests. |
 | `redirectURL` | `string` | `""` | URL to redirect to for denied requests. Overrides `deniedStatusCode` and `deniedResponseMessage`. |

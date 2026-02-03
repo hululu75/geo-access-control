@@ -66,6 +66,7 @@ http:
           deniedResponseMessage: "Access Denied"
           redirectURL: ""
           cacheSize: 100
+          cacheTTL: 3600
           excludedPaths: ["/health", "/metrics"]
           logAllowedAccess: false
           logDeniedAccess: true
