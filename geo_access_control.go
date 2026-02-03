@@ -130,6 +130,20 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 		return nil, fmt.Errorf("API endpoint is required")
 	}
 
+	// Validate and apply safe defaults for critical config values
+	if config.CacheSize <= 0 {
+		pluginLogger.Warnf("cacheSize %d is invalid, defaulting to 100", config.CacheSize)
+		config.CacheSize = 100
+	}
+	if config.GeoAPITimeout <= 0 {
+		pluginLogger.Warnf("geoAPITimeout %d is invalid, defaulting to 750ms", config.GeoAPITimeout)
+		config.GeoAPITimeout = 750
+	}
+	if config.DeniedStatusCode < 100 || config.DeniedStatusCode > 599 {
+		pluginLogger.Warnf("deniedStatusCode %d is invalid, defaulting to 404", config.DeniedStatusCode)
+		config.DeniedStatusCode = http.StatusNotFound
+	}
+
 	plugin := &GeoAccessControl{
 		next:   next,
 		name:   name,
@@ -410,6 +424,9 @@ func (g *GeoAccessControl) checkIPRules(ipStr string) (decision bool, determined
 // checkGeoAccess determines if access should be allowed based on geo data and hierarchical rules.
 // Returns (allowed bool, matchedRule string)
 func (g *GeoAccessControl) checkGeoAccess(geoData *GeoData) (bool, string) {
+	if geoData == nil {
+		return false, "no geo data"
+	}
 	if geoData.Country == "" {
 		return false, "no country data"
 	}
@@ -466,8 +483,11 @@ func (g *GeoAccessControl) checkGeoAccess(geoData *GeoData) (bool, string) {
 // getGeoData retrieves geolocation data for an IP.
 func (g *GeoAccessControl) getGeoData(ip string) (*GeoData, error) {
 	if cached, found := g.cache.Get(ip); found {
-		g.logger.Debugf("Geo data for IP %s found in cache", ip)
-		return cached.(*GeoData), nil
+		if geoData, ok := cached.(*GeoData); ok {
+			g.logger.Debugf("Geo data for IP %s found in cache", ip)
+			return geoData, nil
+		}
+		g.logger.Warnf("Cache contained invalid type for IP %s, refetching", ip)
 	}
 	
 	apiURL := strings.ReplaceAll(g.config.GeoAPIEndpoint, "{ip}", ip)
