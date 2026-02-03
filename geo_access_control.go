@@ -81,6 +81,7 @@ type GeoAccessControl struct {
 	deniedIPs           []*net.IPNet
 	httpClient          *http.Client
 	logger              *PluginLogger
+	logFile             *os.File
 }
 
 // ipRule associates an IP range with an allow/deny decision.
@@ -108,14 +109,13 @@ type APIResponse struct {
 func New(ctx context.Context, next http.Handler, config *Config, name string) (http.Handler, error) {
 	// Setup logging
 	var logWriter io.Writer = os.Stderr
+	var logFile *os.File
 	if config.LogFilePath != "" {
-		logFile, err := os.OpenFile(config.LogFilePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+		var err error
+		logFile, err = os.OpenFile(config.LogFilePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 		if err != nil {
 			return nil, fmt.Errorf("failed to open log file: %w", err)
 		}
-		// TODO: Add a way to close the log file when the plugin is stopped.
-		// For Traefik plugins, there isn't a direct "shutdown" hook, so this might be tricky.
-		// For now, it will remain open for the lifetime of the plugin.
 		logWriter = io.MultiWriter(os.Stderr, logFile)
 	}
 
@@ -127,6 +127,9 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 
 	if config.GeoAPIEndpoint == "" {
 		pluginLogger.Errorf("API endpoint is required")
+		if logFile != nil {
+			logFile.Close()
+		}
 		return nil, fmt.Errorf("API endpoint is required")
 	}
 
@@ -152,7 +155,15 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 		httpClient: &http.Client{
 			Timeout: time.Duration(config.GeoAPITimeout) * time.Millisecond,
 		},
-		logger: pluginLogger,
+		logger:  pluginLogger,
+		logFile: logFile,
+	}
+
+	// closeOnError cleans up resources if New() fails after this point
+	closeOnError := func() {
+		if logFile != nil {
+			logFile.Close()
+		}
 	}
 
 	plugin.allowedRules = make(map[string]CountryRules)
@@ -251,6 +262,7 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 		re, err := regexp.Compile(pattern)
 		if err != nil {
 			plugin.logger.Errorf("failed to compile excluded path pattern %q: %v", pattern, err)
+			closeOnError()
 			return nil, fmt.Errorf("failed to compile excluded path pattern %q: %w", pattern, err)
 		}
 		plugin.excludedPathRegexps = append(plugin.excludedPathRegexps, re)
@@ -258,6 +270,7 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 
 	if len(plugin.allowedRules) == 0 && len(allowedIPStrings) == 0 && len(deniedIPStrings) == 0 {
 		plugin.logger.Errorf("at least one rule must be specified in 'accessRules'")
+		closeOnError()
 		return nil, fmt.Errorf("at least one rule must be specified in 'accessRules'")
 	}
 
@@ -268,6 +281,7 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 		plugin.allowedIPs, err = parseIPRanges(allowedIPStrings)
 		if err != nil {
 			plugin.logger.Errorf("failed to parse allowed IPs: %v", err)
+			closeOnError()
 			return nil, fmt.Errorf("failed to parse allowed IPs: %w", err)
 		}
 	}
@@ -275,6 +289,7 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 		plugin.deniedIPs, err = parseIPRanges(deniedIPStrings)
 		if err != nil {
 			plugin.logger.Errorf("failed to parse denied IPs: %v", err)
+			closeOnError()
 			return nil, fmt.Errorf("failed to parse denied IPs: %w", err)
 		}
 	}
@@ -288,6 +303,18 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 	}
 
 	return plugin, nil
+}
+
+// Close releases resources held by the plugin (log file, HTTP connections).
+// Should be called when the plugin is being stopped or replaced.
+func (g *GeoAccessControl) Close() error {
+	if g.httpClient != nil {
+		g.httpClient.CloseIdleConnections()
+	}
+	if g.logFile != nil {
+		return g.logFile.Close()
+	}
+	return nil
 }
 
 // ServeHTTP implements the http.Handler interface.
@@ -514,13 +541,16 @@ func (g *GeoAccessControl) getGeoData(ip string) (*GeoData, error) {
 	}
 	defer resp.Body.Close()
 
+	// Limit response body to 1MB to prevent memory abuse
+	const maxBodySize = 1 << 20
+
 	if resp.StatusCode != http.StatusOK {
+		// Drain body so the underlying TCP connection can be reused
+		io.Copy(io.Discard, io.LimitReader(resp.Body, maxBodySize))
 		g.logger.Errorf("GeoAPI returned non-200 status %d from %s for IP %s", resp.StatusCode, apiURL, ip)
 		return nil, fmt.Errorf("GeoAPI returned status %d", resp.StatusCode)
 	}
 
-	// Limit response body to 1MB to prevent memory abuse
-	const maxBodySize = 1 << 20
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBodySize))
 	if err != nil {
 		g.logger.Errorf("Failed to read GeoAPI response body from %s for IP %s: %v", apiURL, ip, err)
