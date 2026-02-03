@@ -121,7 +121,7 @@ func TestAccess(t *testing.T) {
 			if dec, det := geoPlugin.checkIPRules(tt.clientIP); det {
 				decision = dec
 			} else {
-				decision = geoPlugin.checkGeoAccess(tt.geoData)
+				decision, _ = geoPlugin.checkGeoAccess(tt.geoData)
 			}
 
 			if decision != tt.expectedAllow {
