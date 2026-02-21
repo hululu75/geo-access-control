@@ -5,8 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"net"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"regexp"
@@ -30,42 +30,42 @@ type CountryRules struct {
 
 // Config holds the plugin configuration.
 type Config struct {
-	GeoAPIEndpoint        string                 `json:"geoAPIEndpoint,omitempty"`
-	GeoAPITimeout         int                    `json:"geoAPITimeout,omitempty"`
-	GeoAPIResponseIsJSON  bool                   `json:"geoAPIResponseIsJSON,omitempty"`
-	AccessRules           map[string]interface{} `json:"accessRules,omitempty"`
-	AllowPrivateIPAccess  bool                   `json:"allowPrivateIPAccess,omitempty"`
+	GeoAPIEndpoint              string                 `json:"geoAPIEndpoint,omitempty"`
+	GeoAPITimeout               int                    `json:"geoAPITimeout,omitempty"`
+	GeoAPIResponseIsJSON        bool                   `json:"geoAPIResponseIsJSON,omitempty"`
+	AccessRules                 map[string]interface{} `json:"accessRules,omitempty"`
+	AllowPrivateIPAccess        bool                   `json:"allowPrivateIPAccess,omitempty"`
 	AllowRequestsWithoutGeoData bool                   `json:"allowRequestsWithoutGeoData,omitempty"`
-	CacheSize             int                    `json:"cacheSize,omitempty"`
-	CacheTTL              int                    `json:"cacheTTL,omitempty"`
-	DeniedStatusCode      int                    `json:"deniedStatusCode,omitempty"`
-	DeniedResponseMessage string                 `json:"deniedResponseMessage,omitempty"`
-	RedirectURL           string                 `json:"redirectURL,omitempty"`
-	ExcludedPaths         []string               `json:"excludedPaths,omitempty"`
-	LogAllowedAccess      bool                   `json:"logAllowedAccess,omitempty"`
-	LogDeniedAccess       bool                   `json:"logDeniedAccess,omitempty"`
-	LogGeoAPICalls        bool                   `json:"logGeoAPICalls,omitempty"`
-	LogPrivateIPAccess    bool                   `json:"logPrivateIPAccess,omitempty"`
-	LogWhiteListAccess    bool                   `json:"logWhiteListAccess,omitempty"`
-	LogLevel              string                 `json:"logLevel,omitempty"`
-	LogFilePath           string                 `json:"logFilePath,omitempty"`
+	CacheSize                   int                    `json:"cacheSize,omitempty"`
+	CacheTTL                    int                    `json:"cacheTTL,omitempty"`
+	DeniedStatusCode            int                    `json:"deniedStatusCode,omitempty"`
+	DeniedResponseMessage       string                 `json:"deniedResponseMessage,omitempty"`
+	RedirectURL                 string                 `json:"redirectURL,omitempty"`
+	ExcludedPaths               []string               `json:"excludedPaths,omitempty"`
+	LogAllowedAccess            bool                   `json:"logAllowedAccess,omitempty"`
+	LogDeniedAccess             bool                   `json:"logDeniedAccess,omitempty"`
+	LogGeoAPICalls              bool                   `json:"logGeoAPICalls,omitempty"`
+	LogPrivateIPAccess          bool                   `json:"logPrivateIPAccess,omitempty"`
+	LogWhiteListAccess          bool                   `json:"logWhiteListAccess,omitempty"`
+	LogLevel                    string                 `json:"logLevel,omitempty"`
+	LogFilePath                 string                 `json:"logFilePath,omitempty"`
 }
 
 // CreateConfig creates and initializes the default plugin configuration.
 func CreateConfig() *Config {
 	return &Config{
-		GeoAPIEndpoint:          "http://geoip-api:8080/country/{ip}",
-		GeoAPITimeout:           750, // GeoAPI timeout in milliseconds
-		GeoAPIResponseIsJSON:         true,
-		AccessRules:           make(map[string]interface{}),
-		AllowPrivateIPAccess:    true,
+		GeoAPIEndpoint:              "http://geoip-api:8080/country/{ip}",
+		GeoAPITimeout:               750, // GeoAPI timeout in milliseconds
+		GeoAPIResponseIsJSON:        true,
+		AccessRules:                 make(map[string]interface{}),
+		AllowPrivateIPAccess:        true,
 		AllowRequestsWithoutGeoData: false,
-		CacheSize:             100,
-		CacheTTL:              3600, // Cache TTL in seconds (0 = no expiration)
-		DeniedStatusCode:      http.StatusNotFound,
-		DeniedResponseMessage:         "Not Found",
-		LogLevel:              "info", // Default log level
-		LogFilePath:           "",     // Default empty log file path
+		CacheSize:                   100,
+		CacheTTL:                    3600, // Cache TTL in seconds (0 = no expiration)
+		DeniedStatusCode:            http.StatusNotFound,
+		DeniedResponseMessage:       "Not Found",
+		LogLevel:                    "info", // Default log level
+		LogFilePath:                 "",     // Default empty log file path
 	}
 }
 
@@ -362,7 +362,7 @@ func (g *GeoAccessControl) ServeHTTP(rw http.ResponseWriter, req *http.Request) 
 		return
 	}
 
-	geoData, err := g.getGeoData(clientIP)
+	geoData, err := g.getGeoData(clientIP, req)
 	if err != nil {
 		if g.config.LogDeniedAccess {
 			g.logger.Errorf("Error getting geo data for IP %s to %s: %v", clientIP, g.formatURLForLevel(req, g.logger.level), err)
@@ -510,7 +510,7 @@ func (g *GeoAccessControl) checkGeoAccess(geoData *GeoData) (bool, string) {
 }
 
 // getGeoData retrieves geolocation data for an IP.
-func (g *GeoAccessControl) getGeoData(ip string) (*GeoData, error) {
+func (g *GeoAccessControl) getGeoData(ip string, req *http.Request) (*GeoData, error) {
 	if cached, found := g.cache.Get(ip); found {
 		if geoData, ok := cached.(*GeoData); ok {
 			g.logger.Debugf("Geo data for IP %s found in cache", ip)
@@ -518,7 +518,7 @@ func (g *GeoAccessControl) getGeoData(ip string) (*GeoData, error) {
 		}
 		g.logger.Warnf("Cache contained invalid type for IP %s, refetching", ip)
 	}
-	
+
 	apiURL := strings.ReplaceAll(g.config.GeoAPIEndpoint, "{ip}", ip)
 	if g.needsCityLevelData() {
 		apiURL = strings.ReplaceAll(apiURL, "/country/", "/city/")
@@ -533,7 +533,8 @@ func (g *GeoAccessControl) getGeoData(ip string) (*GeoData, error) {
 	}
 
 	if g.config.LogGeoAPICalls {
-		g.logger.Debugf("Making GeoAPI call to: %s for IP: %s", apiURL, ip)
+		userAgent := req.Header.Get("User-Agent")
+		g.logger.Debugf("Making GeoAPI call to: %s for IP: %s, User-Agent: %s", apiURL, ip, userAgent)
 	}
 
 	resp, err := g.httpClient.Get(apiURL)
@@ -558,7 +559,7 @@ func (g *GeoAccessControl) getGeoData(ip string) (*GeoData, error) {
 		g.logger.Errorf("Failed to read GeoAPI response body from %s for IP %s: %v", apiURL, ip, err)
 		return nil, err
 	}
-	
+
 	geoData := &GeoData{}
 	if strings.HasPrefix(string(body), "{") {
 		var apiResp APIResponse

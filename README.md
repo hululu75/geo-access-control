@@ -411,7 +411,7 @@ http:
 | `excludedPaths` | `[]string` | `[]` | A list of regular expression patterns for paths that should be excluded from geo-access control checks. |
 | `logAllowedAccess` | `boolean` | `false` | Log allowed requests. |
 | `logDeniedAccess` | `boolean` | `false` | Log blocked requests. |
-| `logGeoAPICalls` | `boolean` | `false` | Log requests to the Geo IP API. |
+| `logGeoAPICalls` | `boolean` | `false` | Log requests to the Geo IP API with User-Agent information. |
 | `logPrivateIPAccess` | `boolean` | `false` | Log requests from private IP ranges. |
 | `logWhiteListAccess` | `boolean` | `false` | Log requests allowed by IP whitelist rules. |
 | `logLevel` | `string` | `"info"` | Log level: `debug`, `info`, `warn`, or `error`. |
@@ -423,7 +423,7 @@ http:
 
 The plugin supports four log levels via the `logLevel` configuration option:
 
-- **debug**: Most verbose. Logs all requests with full URL paths (e.g., `https://example.com/api/users`), API calls, cache hits, and detailed processing information.
+- **debug**: Most verbose. Logs all requests with full URL paths (e.g., `https://example.com/api/users`), API calls with User-Agent information, cache hits, and detailed processing information.
 - **info** (default): Logs allowed/denied requests (if enabled) showing only the website name (e.g., `example.com`), warnings, and errors.
 - **warn**: Logs only warnings and errors, showing website name only.
 - **error**: Logs only errors, showing website name only.
@@ -444,6 +444,7 @@ YYYY/MM/DD HH:MM:SS [PLUGIN_NAME] [LEVEL] message
 Debug level:
 ```
 2026/01/11 08:40:32 [geo-access-control] [DEBUG] Processing request from IP: 1.2.3.4 to https://example.com/api/users
+2026/01/11 08:40:32 [geo-access-control] [DEBUG] Making GeoAPI call to: http://geoip-api:8080/country/1.2.3.4 for IP: 1.2.3.4, User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36
 2026/01/11 08:40:32 [geo-access-control] [WARN] Denied request from IP: 1.2.3.4 (CN, , ) to https://example.com/api/users by geo rule
 ```
 
