@@ -5,14 +5,23 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"net"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"regexp"
 	"strings"
 	"time"
 )
+
+// HostRules defines user agent rules for a specific host.
+type HostRules struct {
+	AllowedUserAgents        []string `json:"allowedUserAgents,omitempty"`
+	BlockedUserAgents        []string `json:"blockedUserAgents,omitempty"`
+	AllowedUserAgentPatterns []string `json:"allowedUserAgentPatterns,omitempty"`
+	BlockedUserAgentPatterns []string `json:"blockedUserAgentPatterns,omitempty"`
+	BlockEmptyUserAgent      *bool    `json:"blockEmptyUserAgent,omitempty"`
+}
 
 // RegionRules defines rules for a specific region within a country.
 type RegionRules struct {
@@ -30,42 +39,44 @@ type CountryRules struct {
 
 // Config holds the plugin configuration.
 type Config struct {
-	GeoAPIEndpoint        string                 `json:"geoAPIEndpoint,omitempty"`
-	GeoAPITimeout         int                    `json:"geoAPITimeout,omitempty"`
-	GeoAPIResponseIsJSON  bool                   `json:"geoAPIResponseIsJSON,omitempty"`
-	AccessRules           map[string]interface{} `json:"accessRules,omitempty"`
-	AllowPrivateIPAccess  bool                   `json:"allowPrivateIPAccess,omitempty"`
+	GeoAPIEndpoint              string                 `json:"geoAPIEndpoint,omitempty"`
+	GeoAPITimeout               int                    `json:"geoAPITimeout,omitempty"`
+	GeoAPIResponseIsJSON        bool                   `json:"geoAPIResponseIsJSON,omitempty"`
+	AccessRules                 map[string]interface{} `json:"accessRules,omitempty"`
+	PerHostRules                map[string]HostRules   `json:"perHostRules,omitempty"`
+	AllowPrivateIPAccess        bool                   `json:"allowPrivateIPAccess,omitempty"`
 	AllowRequestsWithoutGeoData bool                   `json:"allowRequestsWithoutGeoData,omitempty"`
-	CacheSize             int                    `json:"cacheSize,omitempty"`
-	CacheTTL              int                    `json:"cacheTTL,omitempty"`
-	DeniedStatusCode      int                    `json:"deniedStatusCode,omitempty"`
-	DeniedResponseMessage string                 `json:"deniedResponseMessage,omitempty"`
-	RedirectURL           string                 `json:"redirectURL,omitempty"`
-	ExcludedPaths         []string               `json:"excludedPaths,omitempty"`
-	LogAllowedAccess      bool                   `json:"logAllowedAccess,omitempty"`
-	LogDeniedAccess       bool                   `json:"logDeniedAccess,omitempty"`
-	LogGeoAPICalls        bool                   `json:"logGeoAPICalls,omitempty"`
-	LogPrivateIPAccess    bool                   `json:"logPrivateIPAccess,omitempty"`
-	LogWhiteListAccess    bool                   `json:"logWhiteListAccess,omitempty"`
-	LogLevel              string                 `json:"logLevel,omitempty"`
-	LogFilePath           string                 `json:"logFilePath,omitempty"`
+	CacheSize                   int                    `json:"cacheSize,omitempty"`
+	CacheTTL                    int                    `json:"cacheTTL,omitempty"`
+	DeniedStatusCode            int                    `json:"deniedStatusCode,omitempty"`
+	DeniedResponseMessage       string                 `json:"deniedResponseMessage,omitempty"`
+	RedirectURL                 string                 `json:"redirectURL,omitempty"`
+	ExcludedPaths               []string               `json:"excludedPaths,omitempty"`
+	LogAllowedAccess            bool                   `json:"logAllowedAccess,omitempty"`
+	LogDeniedAccess             bool                   `json:"logDeniedAccess,omitempty"`
+	LogGeoAPICalls              bool                   `json:"logGeoAPICalls,omitempty"`
+	LogPrivateIPAccess          bool                   `json:"logPrivateIPAccess,omitempty"`
+	LogWhiteListAccess          bool                   `json:"logWhiteListAccess,omitempty"`
+	LogLevel                    string                 `json:"logLevel,omitempty"`
+	LogFilePath                 string                 `json:"logFilePath,omitempty"`
+	BlockEmptyUserAgent         bool                   `json:"blockEmptyUserAgent,omitempty"`
 }
 
 // CreateConfig creates and initializes the default plugin configuration.
 func CreateConfig() *Config {
 	return &Config{
-		GeoAPIEndpoint:          "http://geoip-api:8080/country/{ip}",
-		GeoAPITimeout:           750, // GeoAPI timeout in milliseconds
-		GeoAPIResponseIsJSON:         true,
-		AccessRules:           make(map[string]interface{}),
-		AllowPrivateIPAccess:    true,
+		GeoAPIEndpoint:              "http://geoip-api:8080/country/{ip}",
+		GeoAPITimeout:               750, // GeoAPI timeout in milliseconds
+		GeoAPIResponseIsJSON:        true,
+		AccessRules:                 make(map[string]interface{}),
+		AllowPrivateIPAccess:        true,
 		AllowRequestsWithoutGeoData: false,
-		CacheSize:             100,
-		CacheTTL:              3600, // Cache TTL in seconds (0 = no expiration)
-		DeniedStatusCode:      http.StatusNotFound,
-		DeniedResponseMessage:         "Not Found",
-		LogLevel:              "info", // Default log level
-		LogFilePath:           "",     // Default empty log file path
+		CacheSize:                   100,
+		CacheTTL:                    3600, // Cache TTL in seconds (0 = no expiration)
+		DeniedStatusCode:            http.StatusNotFound,
+		DeniedResponseMessage:       "Not Found",
+		LogLevel:                    "info", // Default log level
+		LogFilePath:                 "",     // Default empty log file path
 	}
 }
 
@@ -81,6 +92,8 @@ type GeoAccessControl struct {
 	ipRules             []ipRule
 	allowedIPs          []*net.IPNet
 	deniedIPs           []*net.IPNet
+	perHostRules        map[string]*parsedHostRules
+	wildcardRules       []wildcardRule
 	httpClient          *http.Client
 	logger              *PluginLogger
 	logFile             *os.File
@@ -90,6 +103,23 @@ type GeoAccessControl struct {
 type ipRule struct {
 	ipNet   *net.IPNet
 	allowed bool
+}
+
+// parsedHostRules holds parsed and compiled host-specific user agent rules.
+type parsedHostRules struct {
+	allowedUserAgents       []string
+	blockedUserAgents       []string
+	allowedUserAgentRegexps []*regexp.Regexp
+	blockedUserAgentRegexps []*regexp.Regexp
+	blockEmptyUserAgent     bool
+	hasBlockEmptyConfig     bool
+}
+
+// wildcardRule holds a wildcard host pattern and its associated rules.
+type wildcardRule struct {
+	pattern  string
+	compiled *regexp.Regexp
+	rules    *parsedHostRules
 }
 
 // GeoData holds geolocation information from API.
@@ -304,6 +334,62 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 		plugin.ipRules = append(plugin.ipRules, ipRule{ipNet: ipNet, allowed: false})
 	}
 
+	// Parse per-host user agent rules
+	plugin.perHostRules = make(map[string]*parsedHostRules)
+	plugin.wildcardRules = make([]wildcardRule, 0)
+
+	for host, rules := range config.PerHostRules {
+		parsedRules := &parsedHostRules{
+			allowedUserAgents:   rules.AllowedUserAgents,
+			blockedUserAgents:   rules.BlockedUserAgents,
+			hasBlockEmptyConfig: rules.BlockEmptyUserAgent != nil,
+		}
+
+		if rules.BlockEmptyUserAgent != nil {
+			parsedRules.blockEmptyUserAgent = *rules.BlockEmptyUserAgent
+		}
+
+		// Compile allowed user agent patterns
+		for _, pattern := range rules.AllowedUserAgentPatterns {
+			re, err := regexp.Compile(pattern)
+			if err != nil {
+				plugin.logger.Errorf("failed to compile allowed user agent pattern %q for host %q: %v", pattern, host, err)
+				closeOnError()
+				return nil, fmt.Errorf("failed to compile allowed user agent pattern %q for host %q: %w", pattern, host, err)
+			}
+			parsedRules.allowedUserAgentRegexps = append(parsedRules.allowedUserAgentRegexps, re)
+		}
+
+		// Compile blocked user agent patterns
+		for _, pattern := range rules.BlockedUserAgentPatterns {
+			re, err := regexp.Compile(pattern)
+			if err != nil {
+				plugin.logger.Errorf("failed to compile blocked user agent pattern %q for host %q: %v", pattern, host, err)
+				closeOnError()
+				return nil, fmt.Errorf("failed to compile blocked user agent pattern %q for host %q: %w", pattern, host, err)
+			}
+			parsedRules.blockedUserAgentRegexps = append(parsedRules.blockedUserAgentRegexps, re)
+		}
+
+		// Check if it's a wildcard rule
+		if strings.Contains(host, "*") {
+			regexPattern := wildcardToRegex(host)
+			re, err := regexp.Compile(regexPattern)
+			if err != nil {
+				plugin.logger.Errorf("failed to compile wildcard host pattern %q: %v", host, err)
+				closeOnError()
+				return nil, fmt.Errorf("failed to compile wildcard host pattern %q: %w", host, err)
+			}
+			plugin.wildcardRules = append(plugin.wildcardRules, wildcardRule{
+				pattern:  host,
+				compiled: re,
+				rules:    parsedRules,
+			})
+		} else {
+			plugin.perHostRules[host] = parsedRules
+		}
+	}
+
 	return plugin, nil
 }
 
@@ -330,7 +416,7 @@ func (g *GeoAccessControl) ServeHTTP(rw http.ResponseWriter, req *http.Request) 
 
 	g.logger.Debugf("Processing request from IP: %s to %s", clientIP, g.formatURL(req))
 
-	// Check excluded paths
+	// 1. Check excluded paths
 	for _, re := range g.excludedPathRegexps {
 		if re.MatchString(req.URL.Path) {
 			g.logger.Debugf("Path %s matched excluded pattern %s, bypassing geo access control", req.URL.Path, re.String())
@@ -339,6 +425,7 @@ func (g *GeoAccessControl) ServeHTTP(rw http.ResponseWriter, req *http.Request) 
 		}
 	}
 
+	// 2. Check IP whitelist/blacklist (explicit IP rules)
 	if decision, determined := g.checkIPRules(clientIP); determined {
 		if decision {
 			if g.config.LogWhiteListAccess {
@@ -354,6 +441,7 @@ func (g *GeoAccessControl) ServeHTTP(rw http.ResponseWriter, req *http.Request) 
 		return
 	}
 
+	// 3. Check private IP (MOVED UP - skip all subsequent checks for private IPs)
 	if g.config.AllowPrivateIPAccess && g.isPrivateIP(clientIP) {
 		if g.config.LogPrivateIPAccess {
 			g.logger.Infof("Allowed request from IP: %s to %s (private IP)", clientIP, g.formatURLForLevel(req, g.logger.level))
@@ -362,7 +450,28 @@ func (g *GeoAccessControl) ServeHTTP(rw http.ResponseWriter, req *http.Request) 
 		return
 	}
 
-	geoData, err := g.getGeoData(clientIP)
+	// 4. Check Host-specific User-Agent rules (NEW)
+	if rules, found := g.getHostRules(req.Host); found {
+		if !g.checkUserAgentByRules(req.Header.Get("User-Agent"), rules, req) {
+			return
+		}
+		// Host rules passed, continue to geo check
+	} else {
+		// No host-specific rules, fall back to global BlockEmptyUserAgent
+		if g.config.BlockEmptyUserAgent {
+			userAgent := strings.TrimSpace(req.Header.Get("User-Agent"))
+			if userAgent == "" {
+				if g.config.LogDeniedAccess {
+					g.logger.Warnf("Denied request from IP: %s to %s (empty User-Agent)", clientIP, g.formatURLForLevel(req, g.logger.level))
+				}
+				g.denyRequest(rw, req, "Empty User-Agent is not allowed")
+				return
+			}
+		}
+	}
+
+	// 5. Geo check (existing logic)
+	geoData, err := g.getGeoData(clientIP, req)
 	if err != nil {
 		if g.config.LogDeniedAccess {
 			g.logger.Errorf("Error getting geo data for IP %s to %s: %v", clientIP, g.formatURLForLevel(req, g.logger.level), err)
@@ -510,7 +619,7 @@ func (g *GeoAccessControl) checkGeoAccess(geoData *GeoData) (bool, string) {
 }
 
 // getGeoData retrieves geolocation data for an IP.
-func (g *GeoAccessControl) getGeoData(ip string) (*GeoData, error) {
+func (g *GeoAccessControl) getGeoData(ip string, req *http.Request) (*GeoData, error) {
 	if cached, found := g.cache.Get(ip); found {
 		if geoData, ok := cached.(*GeoData); ok {
 			g.logger.Debugf("Geo data for IP %s found in cache", ip)
@@ -518,7 +627,7 @@ func (g *GeoAccessControl) getGeoData(ip string) (*GeoData, error) {
 		}
 		g.logger.Warnf("Cache contained invalid type for IP %s, refetching", ip)
 	}
-	
+
 	apiURL := strings.ReplaceAll(g.config.GeoAPIEndpoint, "{ip}", ip)
 	if g.needsCityLevelData() {
 		apiURL = strings.ReplaceAll(apiURL, "/country/", "/city/")
@@ -558,7 +667,7 @@ func (g *GeoAccessControl) getGeoData(ip string) (*GeoData, error) {
 		g.logger.Errorf("Failed to read GeoAPI response body from %s for IP %s: %v", apiURL, ip, err)
 		return nil, err
 	}
-	
+
 	geoData := &GeoData{}
 	if strings.HasPrefix(string(body), "{") {
 		var apiResp APIResponse
@@ -734,6 +843,97 @@ func (g *GeoAccessControl) formatURLForLevel(req *http.Request, level LogLevel) 
 		return g.formatURL(req)
 	}
 	return req.Host
+}
+
+// getHostRules finds rules matching the current request host.
+// Supports exact match, wildcard match, and host with port.
+func (g *GeoAccessControl) getHostRules(host string) (*parsedHostRules, bool) {
+	if rules, found := g.perHostRules[host]; found {
+		return rules, true
+	}
+
+	for _, wildcard := range g.wildcardRules {
+		if wildcard.compiled.MatchString(host) {
+			return wildcard.rules, true
+		}
+	}
+
+	if colonIdx := strings.Index(host, ":"); colonIdx > 0 {
+		hostWithoutPort := host[:colonIdx]
+		if rules, found := g.perHostRules[hostWithoutPort]; found {
+			return rules, true
+		}
+		for _, wildcard := range g.wildcardRules {
+			if wildcard.compiled.MatchString(hostWithoutPort) {
+				return wildcard.rules, true
+			}
+		}
+	}
+
+	return nil, false
+}
+
+// checkUserAgentByRules checks User-Agent against host-specific rules.
+func (g *GeoAccessControl) checkUserAgentByRules(userAgent string, rules *parsedHostRules, req *http.Request) bool {
+	userAgent = strings.TrimSpace(userAgent)
+
+	if rules.hasBlockEmptyConfig {
+		if userAgent == "" {
+			if rules.blockEmptyUserAgent {
+				if g.config.LogDeniedAccess {
+					g.logger.Warnf("Denied request to %s (empty User-Agent by host rule)", req.Host)
+				}
+				return false
+			}
+			return true
+		}
+	}
+
+	for _, blockedUA := range rules.blockedUserAgents {
+		if strings.Contains(userAgent, blockedUA) {
+			if g.config.LogDeniedAccess {
+				g.logger.Warnf("Denied request to %s (User-Agent blocked by string: %s)", req.Host, blockedUA)
+			}
+			return false
+		}
+	}
+
+	for _, pattern := range rules.blockedUserAgentRegexps {
+		if pattern.MatchString(userAgent) {
+			if g.config.LogDeniedAccess {
+				g.logger.Warnf("Denied request to %s (User-Agent blocked by regex)", req.Host)
+			}
+			return false
+		}
+	}
+
+	if len(rules.allowedUserAgents) > 0 || len(rules.allowedUserAgentRegexps) > 0 {
+		for _, allowedUA := range rules.allowedUserAgents {
+			if strings.Contains(userAgent, allowedUA) {
+				return true
+			}
+		}
+
+		for _, pattern := range rules.allowedUserAgentRegexps {
+			if pattern.MatchString(userAgent) {
+				return true
+			}
+		}
+
+		if g.config.LogDeniedAccess {
+			g.logger.Warnf("Denied request to %s (User-Agent not in whitelist)", req.Host)
+		}
+		return false
+	}
+
+	return true
+}
+
+// wildcardToRegex converts a wildcard pattern to a regex pattern.
+func wildcardToRegex(pattern string) string {
+	escaped := regexp.QuoteMeta(pattern)
+	escaped = strings.ReplaceAll(escaped, `\*`, `.*`)
+	return "^" + escaped + "$"
 }
 
 // contains checks if a string is in a slice.

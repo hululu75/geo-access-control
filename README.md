@@ -8,6 +8,8 @@ A Traefik middleware plugin for controlling access based on geographic location 
 - **"Most Specific Rule Wins" Logic**: Granular control with predictable behavior.
 - **Expressive Rules**: Use `true` for "allow" and `false` for "deny" at any level of the hierarchy.
 - **IP-Based Rules**: Explicitly allow or deny individual IPs or CIDR ranges, with IP rules taking precedence over geo-rules. Uses "most specific wins" logic (longest prefix match).
+- **Host-Specific User-Agent Rules**: Configure different User-Agent allow/block lists for each host/domain. Supports string matching and regex patterns, with wildcard host support (e.g., `*.example.com`).
+- **Smart Priority Order**: Private IPs bypass all checks; IP rules take highest priority; Host rules override global settings; Geo rules apply last.
 - **JSON and text format support**: Automatic parsing of both JSON and text API responses.
 - **Integration with geoip-api**: Optimized for use with your self-hosted GeoIP API.
 - **LRU caching with TTL**: Fast IP lookups with configurable cache size and time-based expiration.
@@ -401,7 +403,8 @@ http:
 | `geoAPITimeout` | `int` | `750` | Timeout for the API request in milliseconds. |
 | `geoAPIResponseIsJSON` | `boolean` | `true` | If your API returns JSON. |
 | `accessRules` | `map[string]interface{}` | `{}` | **Unified map of allow/deny rules.** Keys are country codes or IPs/CIDR. Values are `true` (allow) or `false` (deny), or a map for nested rules. |
-| `allowPrivateIPAccess` | `boolean` | `true` | Allow requests from private IP ranges (e.g., 10.0.0.0/8, 192.168.0.0/16). |
+| `perHostRules` | `map[string]HostRules` | `{}` | **Host-specific User-Agent rules.** Keys are hostnames (exact or wildcard like `*.example.com`). Values are User-Agent allow/block rules. |
+| `allowPrivateIPAccess` | `boolean` | `true` | Allow requests from private IP ranges (e.g., 10.0.0.0/8, 192.168.0.0/16). **Bypasses all checks including host-specific User-Agent rules.** |
 | `allowRequestsWithoutGeoData` | `boolean` | `false` | Allow requests if the geographic data cannot be determined by the API. |
 | `cacheSize` | `int` | `100` | Size of the LRU cache for geo IP lookups. |
 | `cacheTTL` | `int` | `3600` | Cache entry time-to-live in seconds. Expired entries are automatically removed on access and re-fetched from the GeoIP API. Set to `0` to disable TTL (entries only evicted by capacity). |
@@ -416,6 +419,158 @@ http:
 | `logWhiteListAccess` | `boolean` | `false` | Log requests allowed by IP whitelist rules. |
 | `logLevel` | `string` | `"info"` | Log level: `debug`, `info`, `warn`, or `error`. |
 | `logFilePath` | `string` | `""` | Path to save logs to file. If empty, logs only output to Traefik. Can be used for fail2ban integration. |
+| `blockEmptyUserAgent` | `boolean` | `true` | Block requests with an empty User-Agent header. **Overridable by per-host rules.** |
+
+## Host-Specific User-Agent Rules
+
+The `perHostRules` option allows you to define different User-Agent access control rules for each host/domain. This is useful when you have multiple websites behind the same Traefik instance with different User-Agent requirements.
+
+### Rule Priority Order
+
+Requests are checked in this order:
+
+1. **Excluded paths** - Bypass all checks if path matches an excluded pattern
+2. **IP whitelist/blacklist** - Highest priority; if matched, skips all other checks
+3. **Private IP check** - If `allowPrivateIPAccess=true`, private IPs bypass ALL checks (including host-specific User-Agent rules)
+4. **Host-specific User-Agent rules** - Applied only if host matches a configured rule
+5. **Global empty User-Agent check** - Applied only if no host-specific rule matches
+6. **Geo rules** - Country/region/city-based access control
+
+### Host Rules Structure
+
+For each host, you can configure:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `allowedUserAgents` | `[]string` | List of allowed User-Agent strings (substring match) |
+| `blockedUserAgents` | `[]string` | List of blocked User-Agent strings (substring match) |
+| `allowedUserAgentPatterns` | `[]string` | List of allowed User-Agent regex patterns |
+| `blockedUserAgentPatterns` | `[]string` | List of blocked User-Agent regex patterns |
+| `blockEmptyUserAgent` | `boolean` | Override global empty User-Agent setting for this host |
+
+### Host Matching
+
+The plugin supports three types of host matching:
+
+1. **Exact match**: `api.example.com` matches only `api.example.com`
+2. **Wildcard match**: `*.example.com` matches any subdomain of `example.com`
+3. **Port-aware**: Automatically matches hosts with or without port (e.g., `example.com:8080`)
+
+### Configuration Examples
+
+#### Example 1: API Endpoint with Strict User-Agent Whitelist
+
+```yaml
+http:
+  middlewares:
+    geo-filter:
+      plugin:
+        geo-access-control:
+          geoAPIEndpoint: "http://geoip-api:8080/country/{ip}"
+          blockEmptyUserAgent: true
+          
+          perHostRules:
+            api.example.com:
+              # Only allow specific API clients
+              allowedUserAgents:
+                - "MyApiClient/1.0"
+                - "MyApiClient/2.0"
+                - "OfficialApp"
+              # Block all bots
+              blockedUserAgentPatterns:
+                - ".*bot.*"
+                - ".*crawler.*"
+          
+          accessRules:
+            US: true
+            CA: true
+```
+
+#### Example 2: Public Site with Bot Blocking
+
+```yaml
+perHostRules:
+  "*.example.com":
+    # Block common bots and crawlers
+    blockedUserAgents:
+      - "curl"
+      - "wget"
+      - "python-requests"
+    blockedUserAgentPatterns:
+      - ".*bot.*"
+      - ".*crawler.*"
+      - ".*spider.*"
+    # Allow empty User-Agent (override global setting)
+    blockEmptyUserAgent: false
+  
+  admin.example.com:
+    # Admin panel - strict whitelist only
+    allowedUserAgents:
+      - "Mozilla/5.0"
+    blockEmptyUserAgent: true
+```
+
+#### Example 3: Mixed Configuration
+
+```yaml
+http:
+  middlewares:
+    geo-filter:
+      plugin:
+        geo-access-control:
+          geoAPIEndpoint: "http://geoip-api:8080/country/{ip}"
+          allowPrivateIPAccess: true  # Skip all checks for private IPs
+          blockEmptyUserAgent: true  # Global default
+          
+          perHostRules:
+            # API - whitelist mode
+            api.example.com:
+              allowedUserAgents: ["MyApiClient"]
+            
+            # All subdomains - blacklist mode
+            "*.example.com":
+              blockedUserAgentPatterns: [".*bot.*", ".*crawler.*"]
+            
+            # Public site - allow empty User-Agent
+            www.example.com:
+              blockEmptyUserAgent: false
+              
+            # Internal tool - no User-Agent restrictions
+            internal.example.com:
+              # No rules means using global blockEmptyUserAgent setting
+          
+          accessRules:
+            US: true
+            GB: true
+```
+
+### Whitelist vs Blacklist Mode
+
+- **Whitelist mode**: Configure `allowedUserAgents` or `allowedUserAgentPatterns`. Only requests matching the whitelist are allowed.
+- **Blacklist mode**: Configure `blockedUserAgents` or `blockedUserAgentPatterns`. Requests matching the blacklist are denied, others allowed.
+- **Combined mode**: Configure both. Blacklist is checked first, then whitelist.
+
+**Example - Combined mode:**
+```yaml
+perHostRules:
+  example.com:
+    # Block these specific bad agents
+    blockedUserAgents:
+      - "BadBot"
+      - "MaliciousScanner"
+    # Only allow these good agents
+    allowedUserAgents:
+      - "GoodBrowser"
+      - "MobileApp"
+```
+
+### Notes
+
+- Host rules are case-insensitive
+- String matching uses substring matching (e.g., "Mozilla" matches "Mozilla/5.0")
+- Regex patterns must be valid Go regex syntax
+- If a host has no per-host rule configured, the global `blockEmptyUserAgent` setting is used
+- `*.example.com` does NOT match `example.com` itself (use both if needed)
 
 ## Logging and fail2ban Integration
 

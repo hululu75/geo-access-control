@@ -3,6 +3,7 @@ package geo_access_control
 import (
 	"context"
 	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 )
@@ -204,5 +205,274 @@ func TestCreateConfigCacheTTL(t *testing.T) {
 	config := CreateConfig()
 	if config.CacheTTL != 3600 {
 		t.Errorf("Expected default cacheTTL to be 3600, got %d", config.CacheTTL)
+	}
+}
+
+func TestHostRulesParsing(t *testing.T) {
+	config := &Config{
+		GeoAPIEndpoint: "http://test-api",
+		AccessRules: map[string]interface{}{
+			"1.2.3.4": true,
+		},
+		PerHostRules: map[string]HostRules{
+			"example.com": {
+				AllowedUserAgents:        []string{"Mozilla", "Chrome"},
+				BlockedUserAgents:        []string{"curl", "wget"},
+				AllowedUserAgentPatterns: []string{"^MyApp/.*"},
+				BlockedUserAgentPatterns: []string{".*bot.*"},
+			},
+			"*.test.com": {
+				BlockedUserAgentPatterns: []string{".*crawler.*"},
+			},
+		},
+	}
+
+	plugin, err := New(context.Background(), nil, config, "test-plugin")
+	if err != nil {
+		t.Fatalf("Failed to create plugin: %v", err)
+	}
+	geoPlugin := plugin.(*GeoAccessControl)
+
+	// Check exact match host rules
+	if rules, found := geoPlugin.getHostRules("example.com"); !found {
+		t.Error("Expected to find rules for example.com")
+	} else {
+		if len(rules.allowedUserAgents) != 2 {
+			t.Errorf("Expected 2 allowed user agents, got %d", len(rules.allowedUserAgents))
+		}
+		if len(rules.blockedUserAgentRegexps) != 1 {
+			t.Errorf("Expected 1 blocked user agent regex, got %d", len(rules.blockedUserAgentRegexps))
+		}
+	}
+
+	// Check wildcard host rules
+	if rules, found := geoPlugin.getHostRules("sub.test.com"); !found {
+		t.Error("Expected to find rules for sub.test.com via wildcard")
+	} else {
+		if len(rules.blockedUserAgentRegexps) != 1 {
+			t.Errorf("Expected 1 blocked user agent regex, got %d", len(rules.blockedUserAgentRegexps))
+		}
+	}
+
+	// Check host with port
+	if rules, found := geoPlugin.getHostRules("example.com:8080"); !found {
+		t.Error("Expected to find rules for example.com:8080")
+	} else {
+		if len(rules.allowedUserAgents) != 2 {
+			t.Errorf("Expected 2 allowed user agents, got %d", len(rules.allowedUserAgents))
+		}
+	}
+}
+
+func TestHostRulesMatching(t *testing.T) {
+	config := &Config{
+		GeoAPIEndpoint: "http://test-api",
+		AccessRules: map[string]interface{}{
+			"1.2.3.4": true,
+		},
+		PerHostRules: map[string]HostRules{
+			"example.com": {
+				AllowedUserAgents: []string{"MyApp"},
+				BlockedUserAgents: []string{"BadBot"},
+			},
+			"*.test.com": {
+				BlockedUserAgentPatterns: []string{".*[Bb]ot.*"},
+			},
+		},
+	}
+
+	plugin, err := New(context.Background(), nil, config, "test-plugin")
+	if err != nil {
+		t.Fatalf("Failed to create plugin: %v", err)
+	}
+	geoPlugin := plugin.(*GeoAccessControl)
+
+	tests := []struct {
+		name          string
+		host          string
+		userAgent     string
+		expectedAllow bool
+	}{
+		{"Allowed string match", "example.com", "MyApp/1.0", true},
+		{"Blocked string match", "example.com", "BadBot/1.0", false},
+		{"Not in whitelist", "example.com", "OtherApp", false},
+		{"Wildcard blocked by regex", "sub.test.com", "EvilBot", false},
+		{"Wildcard allowed", "sub.test.com", "GoodBrowser", true},
+		{"No host rules", "unknown.com", "AnyAgent", true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rules, found := geoPlugin.getHostRules(tt.host)
+			if !found {
+				// No host rules means allow (default behavior)
+				return
+			}
+			allowed := geoPlugin.checkUserAgentByRules(tt.userAgent, rules, &http.Request{Host: tt.host})
+			if allowed != tt.expectedAllow {
+				t.Errorf("Expected %v for User-Agent %q on host %s, got %v", tt.expectedAllow, tt.userAgent, tt.host, allowed)
+			}
+		})
+	}
+}
+
+func TestPrivateIPBypassesHostRules(t *testing.T) {
+	config := &Config{
+		GeoAPIEndpoint:       "http://test-api",
+		AllowPrivateIPAccess: true,
+		BlockEmptyUserAgent:  true,
+		AccessRules: map[string]interface{}{
+			"US": true,
+		},
+		PerHostRules: map[string]HostRules{
+			"example.com": {
+				BlockedUserAgents: []string{"Everything"},
+			},
+		},
+	}
+
+	plugin, err := New(context.Background(), nil, config, "test-plugin")
+	if err != nil {
+		t.Fatalf("Failed to create plugin: %v", err)
+	}
+
+	nextCalled := false
+	nextHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		nextCalled = true
+		w.WriteHeader(http.StatusOK)
+	})
+
+	plugin.(*GeoAccessControl).next = nextHandler
+
+	rec := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "http://example.com/test", nil)
+	req.RemoteAddr = "192.168.1.100:1234"
+	req.Header.Set("User-Agent", "Everything")
+
+	plugin.ServeHTTP(rec, req)
+
+	if !nextCalled {
+		t.Error("Expected next handler to be called for private IP, even if User-Agent is blocked by host rules")
+	}
+}
+
+func TestBlockEmptyUserAgentPerHost(t *testing.T) {
+	config := &Config{
+		GeoAPIEndpoint:              "http://test-api",
+		BlockEmptyUserAgent:         false,
+		AllowPrivateIPAccess:        false,
+		AllowRequestsWithoutGeoData: true,
+		AccessRules: map[string]interface{}{
+			"US": true,
+		},
+		PerHostRules: map[string]HostRules{
+			"strict.example.com": {
+				BlockEmptyUserAgent: func() *bool { b := true; return &b }(),
+			},
+			"lenient.example.com": {
+				BlockEmptyUserAgent: func() *bool { b := false; return &b }(),
+			},
+		},
+	}
+
+	plugin, err := New(context.Background(), nil, config, "test-plugin")
+	if err != nil {
+		t.Fatalf("Failed to create plugin: %v", err)
+	}
+
+	tests := []struct {
+		name          string
+		host          string
+		userAgent     string
+		expectedAllow bool
+	}{
+		{"Strict host blocks empty UA", "strict.example.com", "", false},
+		{"Strict host allows with UA", "strict.example.com", "Mozilla", true},
+		{"Lenient host allows empty UA", "lenient.example.com", "", true},
+		{"Lenient host allows with UA", "lenient.example.com", "Mozilla", true},
+		{"No host rule uses global", "unknown.com", "", true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			nextCalled := false
+			nextHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				nextCalled = true
+				w.WriteHeader(http.StatusOK)
+			})
+
+			plugin.(*GeoAccessControl).next = nextHandler
+
+			rec := httptest.NewRecorder()
+			req, _ := http.NewRequest("GET", "http://"+tt.host+"/test", nil)
+			req.RemoteAddr = "8.8.8.8:1234"
+			req.Header.Set("User-Agent", tt.userAgent)
+
+			plugin.ServeHTTP(rec, req)
+
+			if nextCalled != tt.expectedAllow {
+				t.Errorf("Expected next called=%v for host %s with UA %q, got %v", tt.expectedAllow, tt.host, tt.userAgent, nextCalled)
+			}
+		})
+	}
+}
+
+func TestExecutionOrder(t *testing.T) {
+	config := &Config{
+		GeoAPIEndpoint:              "http://test-api",
+		AllowPrivateIPAccess:        true,
+		BlockEmptyUserAgent:         true,
+		AllowRequestsWithoutGeoData: true,
+		AccessRules: map[string]interface{}{
+			"US":         true,
+			"10.0.0.0/8": true,
+		},
+		PerHostRules: map[string]HostRules{
+			"*.example.com": {
+				BlockedUserAgents: []string{"Blocked"},
+			},
+		},
+	}
+
+	plugin, err := New(context.Background(), nil, config, "test-plugin")
+	if err != nil {
+		t.Fatalf("Failed to create plugin: %v", err)
+	}
+
+	tests := []struct {
+		name          string
+		ip            string
+		userAgent     string
+		host          string
+		expectedAllow bool
+		reason        string
+	}{
+		{"Private IP bypasses all", "192.168.1.1", "Blocked", "api.example.com", true, "private IP"},
+		{"IP whitelist bypasses host rules", "10.0.0.1", "Blocked", "api.example.com", true, "IP whitelist"},
+		{"Host rules block", "8.8.8.8", "Blocked", "api.example.com", false, "host rule"},
+		{"Host rules allow", "8.8.8.8", "Allowed", "api.example.com", true, "host rule"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			nextCalled := false
+			nextHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				nextCalled = true
+				w.WriteHeader(http.StatusOK)
+			})
+
+			plugin.(*GeoAccessControl).next = nextHandler
+
+			rec := httptest.NewRecorder()
+			req, _ := http.NewRequest("GET", "http://"+tt.host+"/test", nil)
+			req.RemoteAddr = tt.ip + ":1234"
+			req.Header.Set("User-Agent", tt.userAgent)
+
+			plugin.ServeHTTP(rec, req)
+
+			if nextCalled != tt.expectedAllow {
+				t.Errorf("%s: Expected allow=%v, got %v", tt.name, tt.expectedAllow, nextCalled)
+			}
+		})
 	}
 }
