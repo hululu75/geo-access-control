@@ -450,7 +450,7 @@ func TestExecutionOrder(t *testing.T) {
 		{"Private IP bypasses all", "192.168.1.1", "Blocked", "api.example.com", true, "private IP"},
 		{"IP whitelist bypasses host rules", "10.0.0.1", "Blocked", "api.example.com", true, "IP whitelist"},
 		{"Host rules block", "8.8.8.8", "Blocked", "api.example.com", false, "host rule"},
-		{"Host rules allow", "8.8.8.8", "Allowed", "api.example.com", true, "host rule"},
+		{"Host rules allow", "8.8.8.8", "Allowed", "api.example.com", true, "host rule + geo allow"},
 	}
 
 	for _, tt := range tests {
@@ -474,5 +474,53 @@ func TestExecutionOrder(t *testing.T) {
 				t.Errorf("%s: Expected allow=%v, got %v", tt.name, tt.expectedAllow, nextCalled)
 			}
 		})
+	}
+}
+
+func TestHostRulesContinueToGeoCheck(t *testing.T) {
+	config := &Config{
+		GeoAPIEndpoint:              "http://test-api",
+		AllowPrivateIPAccess:        false,
+		BlockEmptyUserAgent:         true,
+		AllowRequestsWithoutGeoData: false,
+		AccessRules: map[string]interface{}{
+			"US": true,
+		},
+		PerHostRules: map[string]HostRules{
+			"api.example.com": {
+				AllowedUserAgents: []string{"ValidClient"},
+			},
+		},
+	}
+
+	plugin, err := New(context.Background(), nil, config, "test-plugin")
+	if err != nil {
+		t.Fatalf("Failed to create plugin: %v", err)
+	}
+
+	nextCalled := false
+	nextHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		nextCalled = true
+		w.WriteHeader(http.StatusOK)
+	})
+
+	plugin.(*GeoAccessControl).next = nextHandler
+
+	rec := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "http://api.example.com/test", nil)
+	req.RemoteAddr = "8.8.8.8:1234"
+	req.Header.Set("User-Agent", "ValidClient")
+
+	plugin.ServeHTTP(rec, req)
+
+	// Even though Host rules pass, request should be denied because Geo API fails
+	// and AllowRequestsWithoutGeoData is false
+	if nextCalled {
+		t.Error("Expected request to be denied when Geo API fails and AllowRequestsWithoutGeoData is false")
+	}
+
+	// Verify that response is denied (404 by default)
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("Expected status 404, got %d", rec.Code)
 	}
 }

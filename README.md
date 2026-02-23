@@ -431,10 +431,10 @@ Requests are checked in this order:
 
 1. **Excluded paths** - Bypass all checks if path matches an excluded pattern
 2. **IP whitelist/blacklist** - Highest priority; if matched, skips all other checks
-3. **Private IP check** - If `allowPrivateIPAccess=true`, private IPs bypass ALL checks (including host-specific User-Agent rules)
-4. **Host-specific User-Agent rules** - Applied only if host matches a configured rule
+3. **Private IP check** - If `allowPrivateIPAccess=true`, private IPs bypass ALL checks (including host-specific User-Agent rules and geo rules)
+4. **Host-specific User-Agent rules** - Applied only if host matches a configured rule. **If passed, continues to geo check.**
 5. **Global empty User-Agent check** - Applied only if no host-specific rule matches
-6. **Geo rules** - Country/region/city-based access control
+6. **Geo rules** - Country/region/city-based access control. **Always executed after host rules (unless bypassed by IP rules or private IP).**
 
 ### Host Rules Structure
 
