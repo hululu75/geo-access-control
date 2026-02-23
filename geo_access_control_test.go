@@ -305,7 +305,10 @@ func TestHostRulesMatching(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			rules, found := geoPlugin.getHostRules(tt.host)
 			if !found {
-				// No host rules means allow (default behavior)
+				// No host rules means allow by default; verify the test expectation agrees.
+				if !tt.expectedAllow {
+					t.Errorf("Host %s has no rules (default allow), but test expects deny", tt.host)
+				}
 				return
 			}
 			allowed := geoPlugin.checkUserAgentByRules(tt.userAgent, rules, &http.Request{Host: tt.host})
@@ -576,7 +579,7 @@ func TestHostRulesDeniedSendsResponse(t *testing.T) {
 func TestHostRulesDeniedClosesConnection(t *testing.T) {
 	config := &Config{
 		GeoAPIEndpoint:              "http://test-api",
-		CloseConnectionOnHostReject: true, // Enable connection closing
+		CloseConnectionOnHostReject: true,
 		AccessRules: map[string]interface{}{
 			"US": true,
 		},
@@ -587,7 +590,10 @@ func TestHostRulesDeniedClosesConnection(t *testing.T) {
 		},
 	}
 
-	plugin, _ := New(context.Background(), nil, config, "test-plugin")
+	plugin, err := New(context.Background(), nil, config, "test-plugin")
+	if err != nil {
+		t.Fatalf("Failed to create plugin: %v", err)
+	}
 
 	nextCalled := false
 	nextHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -602,11 +608,25 @@ func TestHostRulesDeniedClosesConnection(t *testing.T) {
 	req.RemoteAddr = "8.8.8.8:1234"
 	req.Header.Set("User-Agent", "InvalidClient")
 
-	plugin.ServeHTTP(rec, req)
+	// httptest.ResponseRecorder does not implement http.Hijacker, so the plugin
+	// falls through to panic(http.ErrAbortHandler) — the HTTP/2 abort path.
+	// Capture the panic so the test can assert on it.
+	var aborted bool
+	func() {
+		defer func() {
+			if r := recover(); r == http.ErrAbortHandler {
+				aborted = true
+			} else if r != nil {
+				t.Errorf("Unexpected panic: %v", r)
+			}
+		}()
+		plugin.ServeHTTP(rec, req)
+	}()
 
 	if nextCalled {
 		t.Error("Expected next handler not to be called when connection is dropped")
 	}
-	// Note: httptest.ResponseRecorder does not support Hijack, so the test logs a warning
-	// but verifies that the next handler is not called
+	if !aborted {
+		t.Error("Expected http.ErrAbortHandler panic when Hijack is not supported")
+	}
 }

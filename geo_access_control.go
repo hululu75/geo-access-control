@@ -1,6 +1,7 @@
 package geo_access_control
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"os"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -97,6 +99,7 @@ type GeoAccessControl struct {
 	perHostRules        map[string]*parsedHostRules
 	wildcardRules       []wildcardRule
 	httpClient          *http.Client
+	geoFlight           sync.Map
 	logger              *PluginLogger
 	logFile             *os.File
 }
@@ -122,6 +125,14 @@ type wildcardRule struct {
 	pattern  string
 	compiled *regexp.Regexp
 	rules    *parsedHostRules
+}
+
+// geoCall tracks an in-flight or completed geo API request.
+// Used for singleflight deduplication of concurrent requests for the same IP.
+type geoCall struct {
+	wg  sync.WaitGroup
+	val *GeoData
+	err error
 }
 
 // GeoData holds geolocation information from API.
@@ -456,26 +467,32 @@ func (g *GeoAccessControl) ServeHTTP(rw http.ResponseWriter, req *http.Request) 
 	if rules, found := g.getHostRules(req.Host); found {
 		if !g.checkUserAgentByRules(req.Header.Get("User-Agent"), rules, req) {
 			if g.config.CloseConnectionOnHostReject {
-				// Drop connection without sending HTTP response
-				hj, ok := rw.(http.Hijacker)
-				if !ok {
-					// Detect HTTP version for clearer message
-					proto := "HTTP/1.x"
-					if req.ProtoMajor == 2 {
-						proto = "HTTP/2"
+				// HTTP/1.x: hijack the TCP connection and close it directly.
+				// Skip hijack for HTTP/2: Traefik wraps the http2ResponseWriter
+				// in a type that satisfies http.Hijacker at compile time but
+				// returns an error at runtime, so we go straight to the
+				// panic-based path to avoid a spurious warning log.
+				if req.ProtoMajor != 2 {
+					if hj, ok := rw.(http.Hijacker); ok {
+						conn, _, err := hj.Hijack()
+						if err == nil {
+							conn.Close()
+							return
+						}
+						g.logger.Warnf("Failed to hijack connection: %v", err)
+						// Fall through to panic-based abort below.
 					}
-					g.logger.Warnf("Cannot close %s connection (Hijack not supported), returning 404 instead", proto)
-					g.denyRequest(rw, req, g.config.DeniedResponseMessage)
-					return
 				}
-				conn, _, err := hj.Hijack()
-				if err != nil {
-					g.logger.Warnf("Failed to hijack connection: %v", err)
-					g.denyRequest(rw, req, g.config.DeniedResponseMessage)
-					return
+				// HTTP/2: panic(http.ErrAbortHandler) causes net/http to send a
+				// RST_STREAM frame (CANCEL), aborting only this stream without
+				// closing the shared TCP connection or affecting other streams.
+				// Also used as fallback when hijack fails on HTTP/1.x.
+				// Traefik re-panics on this sentinel so it reaches the HTTP/2
+				// layer correctly.
+				if g.config.LogDeniedAccess {
+					g.logger.Warnf("Aborting stream for request to %s (User-Agent rejected, proto=%s)", req.Host, req.Proto)
 				}
-				conn.Close()
-				return
+				panic(http.ErrAbortHandler)
 			}
 			// Return 404 response (default behavior)
 			g.denyRequest(rw, req, g.config.DeniedResponseMessage)
@@ -528,15 +545,23 @@ func (g *GeoAccessControl) ServeHTTP(rw http.ResponseWriter, req *http.Request) 
 }
 
 // extractClientIP extracts the client IP from the request.
+// Each candidate value is validated with net.ParseIP before being returned,
+// preventing spoofed headers from injecting non-IP strings into downstream logic.
 func (g *GeoAccessControl) extractClientIP(req *http.Request) string {
 	if xff := req.Header.Get("X-Forwarded-For"); xff != "" {
 		ips := strings.Split(xff, ",")
 		if len(ips) > 0 {
-			return strings.TrimSpace(ips[0])
+			ip := strings.TrimSpace(ips[0])
+			if net.ParseIP(ip) != nil {
+				return ip
+			}
 		}
 	}
 	if xri := req.Header.Get("X-Real-IP"); xri != "" {
-		return strings.TrimSpace(xri)
+		xri = strings.TrimSpace(xri)
+		if net.ParseIP(xri) != nil {
+			return xri
+		}
 	}
 	ip, _, err := net.SplitHostPort(req.RemoteAddr)
 	if err != nil {
@@ -654,6 +679,26 @@ func (g *GeoAccessControl) getGeoData(ip string, req *http.Request) (*GeoData, e
 		g.logger.Warnf("Cache contained invalid type for IP %s, refetching", ip)
 	}
 
+	// Fix 1: Validate the IP before inserting it into the API URL to prevent
+	// SSRF via path traversal in a crafted X-Forwarded-For header.
+	if net.ParseIP(ip) == nil {
+		return nil, fmt.Errorf("invalid IP address: %s", ip)
+	}
+
+	// Fix 4: Singleflight — deduplicate concurrent requests for the same IP so
+	// that only one outbound API call is made while other goroutines wait.
+	newCall := &geoCall{}
+	newCall.wg.Add(1)
+	if actual, loaded := g.geoFlight.LoadOrStore(ip, newCall); loaded {
+		existing := actual.(*geoCall)
+		existing.wg.Wait()
+		return existing.val, existing.err
+	}
+	defer func() {
+		newCall.wg.Done()
+		g.geoFlight.Delete(ip)
+	}()
+
 	apiURL := strings.ReplaceAll(g.config.GeoAPIEndpoint, "{ip}", ip)
 	if g.needsCityLevelData() {
 		apiURL = strings.ReplaceAll(apiURL, "/country/", "/city/")
@@ -674,6 +719,7 @@ func (g *GeoAccessControl) getGeoData(ip string, req *http.Request) (*GeoData, e
 	resp, err := g.httpClient.Get(apiURL)
 	if err != nil {
 		g.logger.Errorf("Failed to make GeoAPI request to %s for IP %s: %v", apiURL, ip, err)
+		newCall.err = err
 		return nil, err
 	}
 	defer resp.Body.Close()
@@ -685,20 +731,27 @@ func (g *GeoAccessControl) getGeoData(ip string, req *http.Request) (*GeoData, e
 		// Drain body so the underlying TCP connection can be reused
 		io.Copy(io.Discard, io.LimitReader(resp.Body, maxBodySize))
 		g.logger.Errorf("GeoAPI returned non-200 status %d from %s for IP %s", resp.StatusCode, apiURL, ip)
-		return nil, fmt.Errorf("GeoAPI returned status %d", resp.StatusCode)
+		err = fmt.Errorf("GeoAPI returned status %d", resp.StatusCode)
+		newCall.err = err
+		return nil, err
 	}
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBodySize))
 	if err != nil {
 		g.logger.Errorf("Failed to read GeoAPI response body from %s for IP %s: %v", apiURL, ip, err)
+		newCall.err = err
 		return nil, err
 	}
 
 	geoData := &GeoData{}
-	if strings.HasPrefix(string(body), "{") {
+	// Fix 3: Trim leading/trailing whitespace before probing for JSON so that
+	// a response like "  { ... }" is not misclassified as plain text.
+	body = bytes.TrimSpace(body)
+	if bytes.HasPrefix(body, []byte("{")) {
 		var apiResp APIResponse
 		if err := json.Unmarshal(body, &apiResp); err != nil {
 			g.logger.Errorf("Failed to unmarshal GeoAPI JSON response from %s for IP %s: %v", apiURL, ip, err)
+			newCall.err = err
 			return nil, err
 		}
 		geoData.Country = apiResp.Country
@@ -719,6 +772,7 @@ func (g *GeoAccessControl) getGeoData(ip string, req *http.Request) (*GeoData, e
 	}
 
 	g.cache.Set(ip, geoData)
+	newCall.val = geoData
 	return geoData, nil
 }
 
@@ -728,6 +782,7 @@ func (g *GeoAccessControl) denyRequest(rw http.ResponseWriter, req *http.Request
 		http.Redirect(rw, req, g.config.RedirectURL, http.StatusTemporaryRedirect)
 		return
 	}
+	rw.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	rw.WriteHeader(g.config.DeniedStatusCode)
 	rw.Write([]byte(g.config.DeniedResponseMessage))
 }
@@ -956,9 +1011,11 @@ func (g *GeoAccessControl) checkUserAgentByRules(userAgent string, rules *parsed
 }
 
 // wildcardToRegex converts a wildcard pattern to a regex pattern.
+// A single '*' matches one or more non-dot characters (one hostname label),
+// so "*.example.com" matches "sub.example.com" but not "a.b.example.com".
 func wildcardToRegex(pattern string) string {
 	escaped := regexp.QuoteMeta(pattern)
-	escaped = strings.ReplaceAll(escaped, `\*`, `.*`)
+	escaped = strings.ReplaceAll(escaped, `\*`, `[^.]+`)
 	return "^" + escaped + "$"
 }
 
