@@ -524,3 +524,51 @@ func TestHostRulesContinueToGeoCheck(t *testing.T) {
 		t.Errorf("Expected status 404, got %d", rec.Code)
 	}
 }
+
+func TestHostRulesDeniedSendsResponse(t *testing.T) {
+	config := &Config{
+		GeoAPIEndpoint:        "http://test-api",
+		DeniedStatusCode:      http.StatusForbidden, // 403
+		DeniedResponseMessage: "Access Denied",
+		AccessRules: map[string]interface{}{
+			"US": true,
+		},
+		PerHostRules: map[string]HostRules{
+			"api.example.com": {
+				AllowedUserAgents: []string{"ValidClient"},
+			},
+		},
+	}
+
+	plugin, err := New(context.Background(), nil, config, "test-plugin")
+	if err != nil {
+		t.Fatalf("Failed to create plugin: %v", err)
+	}
+
+	nextCalled := false
+	nextHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		nextCalled = true
+		w.WriteHeader(http.StatusOK)
+	})
+
+	plugin.(*GeoAccessControl).next = nextHandler
+
+	rec := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "http://api.example.com/test", nil)
+	req.RemoteAddr = "8.8.8.8:1234"
+	req.Header.Set("User-Agent", "InvalidClient")
+
+	plugin.ServeHTTP(rec, req)
+
+	if nextCalled {
+		t.Error("Expected request to be denied when User-Agent is not in whitelist")
+	}
+
+	// Verify that response is sent with configured status code and message
+	if rec.Code != http.StatusForbidden {
+		t.Errorf("Expected status 403, got %d", rec.Code)
+	}
+	if rec.Body.String() != "Access Denied" {
+		t.Errorf("Expected body 'Access Denied', got '%s'", rec.Body.String())
+	}
+}

@@ -453,6 +453,7 @@ func (g *GeoAccessControl) ServeHTTP(rw http.ResponseWriter, req *http.Request) 
 	// 4. Check Host-specific User-Agent rules (NEW)
 	if rules, found := g.getHostRules(req.Host); found {
 		if !g.checkUserAgentByRules(req.Header.Get("User-Agent"), rules, req) {
+			g.denyRequest(rw, req, g.config.DeniedResponseMessage)
 			return
 		}
 		// Host rules passed, continue to geo check
