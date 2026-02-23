@@ -578,6 +578,7 @@ When `closeConnectionOnHostReject` is `true`:
 **Important Notes**:
 
 - When connection dropping is enabled, `redirectURL` is ignored
+- **HTTP/2 limitation**: Due to HTTP/2's multiplexed architecture, connection dropping is not supported. HTTP/2 requests will receive a 404 response instead. See [Limitations](#limitations) section for details.
 - If ResponseWriter doesn't support Hijack, plugin falls back to returning 404 with a warning logged
 - When connection is dropped, clients may see different errors depending on their implementation (EOF, connection reset, timeout)
 - Detailed rejection logs are recorded in both modes for debugging
@@ -644,6 +645,7 @@ perHostRules:
 - ⚠️ May appear as network issues to legitimate users
 - ⚠️ More difficult to debug configuration errors
 - ⚠️ Violates HTTP standards (no proper HTTP response)
+- ⚠️ **HTTP/2 limitation**: Connection dropping only works for HTTP/1.x connections; HTTP/2 requests will receive 404 instead. See [Limitations](#limitations) section for details.
 
 **Recommendations**:
 
@@ -651,6 +653,50 @@ perHostRules:
 - Consider **Drop Connection Mode** for high-security environments where hiding filtering mechanisms is critical
 - Enable detailed logging (`logDeniedAccess`) when using drop mode to facilitate debugging
 - Test thoroughly in your environment before deploying to production
+
+## Limitations
+
+### HTTP/2 Connection Dropping
+
+**Problem**:
+
+- When `closeConnectionOnHostReject` is enabled, the plugin attempts to close the connection using HTTP Hijack
+- **HTTP/2 does not support Hijack** due to its multiplexed architecture
+- For HTTP/2 requests, the plugin will fall back to returning a 404 response with a warning log
+- This is a protocol limitation, not a bug
+
+**When This Happens**:
+
+- Client connects via HTTP/2 (common for HTTPS connections)
+- `closeConnectionOnHostReject` is enabled
+- Host-specific User-Agent rules reject the request
+
+**Behavior**:
+
+- Connection is **not** dropped (due to HTTP/2 limitation)
+- HTTP 404 response is returned instead
+- Rejection reason is still logged (if `logDeniedAccess` is enabled)
+- Security is maintained (no details about filtering are revealed in response)
+
+**Example Warning Log**:
+```
+[WARN] Cannot close HTTP/2 connection (Hijack not supported), returning 404 instead
+[WARN] Denied request to monpass.hellozhao.com (User-Agent not in whitelist)
+```
+
+**Workarounds**:
+
+- If connection dropping is critical, consider disabling HTTP/2 for specific hosts in Traefik configuration
+- Alternatively, accept the HTTP/2 limitation and use 404 responses for HTTP/2 clients
+- Focus on the security benefit: attackers still cannot access your resources
+- The 404 response still provides generic error, protecting filtering details
+
+**Technical Details**:
+
+- HTTP/1.1: One request per connection, supports Hijack
+- HTTP/2: Multiplexed connections, does not support Hijack
+- Modern browsers often use HTTP/2 by default, especially over HTTPS
+- The Go HTTP server's `*http.http2responseWriter` type does not implement `http.Hijacker`
 
 ## Logging and fail2ban Integration
 

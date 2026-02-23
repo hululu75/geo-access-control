@@ -459,7 +459,12 @@ func (g *GeoAccessControl) ServeHTTP(rw http.ResponseWriter, req *http.Request) 
 				// Drop connection without sending HTTP response
 				hj, ok := rw.(http.Hijacker)
 				if !ok {
-					g.logger.Warnf("ResponseWriter does not support Hijack, returning 404 instead")
+					// Detect HTTP version for clearer message
+					proto := "HTTP/1.x"
+					if req.ProtoMajor == 2 {
+						proto = "HTTP/2"
+					}
+					g.logger.Warnf("Cannot close %s connection (Hijack not supported), returning 404 instead", proto)
 					g.denyRequest(rw, req, g.config.DeniedResponseMessage)
 					return
 				}
