@@ -49,6 +49,7 @@ type Config struct {
 	LogWhiteListAccess          bool                   `json:"logWhiteListAccess,omitempty"`
 	LogLevel                    string                 `json:"logLevel,omitempty"`
 	LogFilePath                 string                 `json:"logFilePath,omitempty"`
+	BlockEmptyUserAgent         bool                   `json:"blockEmptyUserAgent,omitempty"`
 }
 
 // CreateConfig creates and initializes the default plugin configuration.
@@ -66,6 +67,7 @@ func CreateConfig() *Config {
 		DeniedResponseMessage:       "Not Found",
 		LogLevel:                    "info", // Default log level
 		LogFilePath:                 "",     // Default empty log file path
+		BlockEmptyUserAgent:         true,
 	}
 }
 
@@ -335,6 +337,17 @@ func (g *GeoAccessControl) ServeHTTP(rw http.ResponseWriter, req *http.Request) 
 		if re.MatchString(req.URL.Path) {
 			g.logger.Debugf("Path %s matched excluded pattern %s, bypassing geo access control", req.URL.Path, re.String())
 			g.next.ServeHTTP(rw, req)
+			return
+		}
+	}
+
+	if g.config.BlockEmptyUserAgent {
+		userAgent := strings.TrimSpace(req.Header.Get("User-Agent"))
+		if userAgent == "" {
+			if g.config.LogDeniedAccess {
+				g.logger.Warnf("Denied request from IP: %s to %s (empty User-Agent)", clientIP, g.formatURLForLevel(req, g.logger.level))
+			}
+			g.denyRequest(rw, req, "Empty User-Agent is not allowed")
 			return
 		}
 	}

@@ -206,3 +206,122 @@ func TestCreateConfigCacheTTL(t *testing.T) {
 		t.Errorf("Expected default cacheTTL to be 3600, got %d", config.CacheTTL)
 	}
 }
+
+func TestBlockEmptyUserAgentDefault(t *testing.T) {
+	config := CreateConfig()
+	if config.BlockEmptyUserAgent != true {
+		t.Errorf("Expected default BlockEmptyUserAgent to be true, got %v", config.BlockEmptyUserAgent)
+	}
+}
+
+func TestBlockEmptyUserAgent(t *testing.T) {
+	config := &Config{
+		GeoAPIEndpoint:      "http://test-api",
+		BlockEmptyUserAgent: true,
+		AccessRules: map[string]interface{}{
+			"US": true,
+		},
+	}
+
+	plugin, err := New(context.Background(), nil, config, "test-plugin")
+	if err != nil {
+		t.Fatalf("Failed to create plugin: %v", err)
+	}
+
+	rec := &mockResponseWriter{}
+	req, _ := http.NewRequest("GET", "/test", nil)
+	req.RemoteAddr = "1.2.3.4:1234"
+
+	plugin.ServeHTTP(rec, req)
+
+	if rec.statusCode != http.StatusNotFound {
+		t.Errorf("Expected status 404, got %d", rec.statusCode)
+	}
+}
+
+func TestBlockEmptyUserAgentWithUserAgent(t *testing.T) {
+	config := &Config{
+		GeoAPIEndpoint:      "http://test-api",
+		BlockEmptyUserAgent: true,
+		AccessRules: map[string]interface{}{
+			"1.2.3.4": true,
+		},
+	}
+
+	plugin, err := New(context.Background(), nil, config, "test-plugin")
+	if err != nil {
+		t.Fatalf("Failed to create plugin: %v", err)
+	}
+
+	nextCalled := false
+	nextHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		nextCalled = true
+		w.WriteHeader(http.StatusOK)
+	})
+
+	rec := &mockResponseWriter{}
+	req, _ := http.NewRequest("GET", "/test", nil)
+	req.RemoteAddr = "1.2.3.4:1234"
+	req.Header.Set("User-Agent", "Mozilla/5.0")
+
+	plugin.(*GeoAccessControl).next = nextHandler
+	plugin.ServeHTTP(rec, req)
+
+	if !nextCalled {
+		t.Error("Expected next handler to be called when User-Agent is present")
+	}
+}
+
+func TestAllowEmptyUserAgent(t *testing.T) {
+	config := &Config{
+		GeoAPIEndpoint:      "http://test-api",
+		BlockEmptyUserAgent: false,
+		AccessRules: map[string]interface{}{
+			"1.2.3.4": true,
+		},
+	}
+
+	plugin, err := New(context.Background(), nil, config, "test-plugin")
+	if err != nil {
+		t.Fatalf("Failed to create plugin: %v", err)
+	}
+
+	nextCalled := false
+	nextHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		nextCalled = true
+		w.WriteHeader(http.StatusOK)
+	})
+
+	rec := &mockResponseWriter{}
+	req, _ := http.NewRequest("GET", "/test", nil)
+	req.RemoteAddr = "1.2.3.4:1234"
+
+	plugin.(*GeoAccessControl).next = nextHandler
+	plugin.ServeHTTP(rec, req)
+
+	if !nextCalled {
+		t.Error("Expected next handler to be called when BlockEmptyUserAgent is false")
+	}
+}
+
+type mockResponseWriter struct {
+	statusCode int
+	header     http.Header
+	body       []byte
+}
+
+func (m *mockResponseWriter) Header() http.Header {
+	if m.header == nil {
+		m.header = make(http.Header)
+	}
+	return m.header
+}
+
+func (m *mockResponseWriter) WriteHeader(statusCode int) {
+	m.statusCode = statusCode
+}
+
+func (m *mockResponseWriter) Write(body []byte) (int, error) {
+	m.body = body
+	return len(body), nil
+}

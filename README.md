@@ -416,6 +416,7 @@ http:
 | `logWhiteListAccess` | `boolean` | `false` | Log requests allowed by IP whitelist rules. |
 | `logLevel` | `string` | `"info"` | Log level: `debug`, `info`, `warn`, or `error`. |
 | `logFilePath` | `string` | `""` | Path to save logs to file. If empty, logs only output to Traefik. Can be used for fail2ban integration. |
+| `blockEmptyUserAgent` | `boolean` | `true` | Block requests with an empty User-Agent header. |
 
 ## Logging and fail2ban Integration
 
