@@ -572,3 +572,41 @@ func TestHostRulesDeniedSendsResponse(t *testing.T) {
 		t.Errorf("Expected body 'Access Denied', got '%s'", rec.Body.String())
 	}
 }
+
+func TestHostRulesDeniedClosesConnection(t *testing.T) {
+	config := &Config{
+		GeoAPIEndpoint:              "http://test-api",
+		CloseConnectionOnHostReject: true, // Enable connection closing
+		AccessRules: map[string]interface{}{
+			"US": true,
+		},
+		PerHostRules: map[string]HostRules{
+			"api.example.com": {
+				AllowedUserAgents: []string{"ValidClient"},
+			},
+		},
+	}
+
+	plugin, _ := New(context.Background(), nil, config, "test-plugin")
+
+	nextCalled := false
+	nextHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		nextCalled = true
+		w.WriteHeader(http.StatusOK)
+	})
+
+	plugin.(*GeoAccessControl).next = nextHandler
+
+	rec := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "http://api.example.com/test", nil)
+	req.RemoteAddr = "8.8.8.8:1234"
+	req.Header.Set("User-Agent", "InvalidClient")
+
+	plugin.ServeHTTP(rec, req)
+
+	if nextCalled {
+		t.Error("Expected next handler not to be called when connection is dropped")
+	}
+	// Note: httptest.ResponseRecorder does not support Hijack, so the test logs a warning
+	// but verifies that the next handler is not called
+}

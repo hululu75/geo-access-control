@@ -420,6 +420,7 @@ http:
 | `logLevel` | `string` | `"info"` | Log level: `debug`, `info`, `warn`, or `error`. |
 | `logFilePath` | `string` | `""` | Path to save logs to file. If empty, logs only output to Traefik. Can be used for fail2ban integration. |
 | `blockEmptyUserAgent` | `boolean` | `true` | Block requests with an empty User-Agent header. **Overridable by per-host rules.** |
+| `closeConnectionOnHostReject` | `boolean` | `false` | Drop connection without sending HTTP response when host user-agent rules reject request. If `false`, returns 404 response. |
 
 ## Host-Specific User-Agent Rules
 
@@ -541,6 +542,61 @@ http:
           
           accessRules:
             US: true
+            CA: true
+```
+
+### Connection Behavior on Host Rule Rejection
+
+When host-specific User-Agent rules reject a request, you can choose to behavior via `closeConnectionOnHostReject`:
+
+#### Mode 1: Return 404 Response (Default)
+
+Default behavior when `closeConnectionOnHostReject` is `false` (or omitted):
+
+- **HTTP Response**: Returns configured `deniedStatusCode` (default: 404) and `deniedResponseMessage`
+- **Logs**: Detailed rejection reason is logged (if `logDeniedAccess` is enabled)
+- **Client Visibility**: Generic error message is visible to client
+- **Use Case**: Standard behavior, easier debugging, better user experience
+
+Configuration example:
+```yaml
+closeConnectionOnHostReject: false  # or omit (default)
+perHostRules:
+  api.example.com:
+    allowedUserAgents: ["MyApp"]
+```
+
+#### Mode 2: Drop Connection
+
+When `closeConnectionOnHostReject` is `true`:
+
+- **HTTP Response**: No HTTP response is sent; connection is closed immediately via Hijack
+- **Logs**: Detailed rejection reason is still logged (if `logDeniedAccess` is enabled)
+- **Client Visibility**: Connection error (EOF, connection reset, or timeout)
+- **Use Case**: Maximum security, hides filtering mechanism from clients
+
+**Important Notes**:
+
+- When connection dropping is enabled, `redirectURL` is ignored
+- If ResponseWriter doesn't support Hijack, plugin falls back to returning 404 with a warning logged
+- When connection is dropped, clients may see different errors depending on their implementation (EOF, connection reset, timeout)
+- Detailed rejection logs are recorded in both modes for debugging
+
+Configuration example:
+```yaml
+closeConnectionOnHostReject: true  # Enable connection dropping
+perHostRules:
+  api.example.com:
+    allowedUserAgents:
+      - "MyApiClient/1.0"
+    blockedUserAgentPatterns:
+      - ".*bot.*"
+```
+            internal.example.com:
+              # No rules means using global blockEmptyUserAgent setting
+          
+          accessRules:
+            US: true
             GB: true
 ```
 
@@ -569,8 +625,32 @@ perHostRules:
 - Host rules are case-insensitive
 - String matching uses substring matching (e.g., "Mozilla" matches "Mozilla/5.0")
 - Regex patterns must be valid Go regex syntax
-- If a host has no per-host rule configured, the global `blockEmptyUserAgent` setting is used
+- If a host has no per-host rule configured, global `blockEmptyUserAgent` setting is used
 - `*.example.com` does NOT match `example.com` itself (use both if needed)
+- Connection dropping via Hijack may not be supported by all HTTP server implementations; plugin falls back to 404 if Hijack is unavailable
+
+### Security Trade-offs
+
+**Return 404 Mode (Default)**:
+- ✅ Follows HTTP standards and specifications
+- ✅ Better user experience with clear error message
+- ✅ Easier debugging and troubleshooting
+- ⚠️ Reveals that access filtering is active (though details are hidden)
+
+**Drop Connection Mode**:
+- ✅ Maximum security, no HTTP response sent
+- ✅ Harder for attackers to detect filtering mechanism
+- ✅ Silent rejection without revealing any information
+- ⚠️ May appear as network issues to legitimate users
+- ⚠️ More difficult to debug configuration errors
+- ⚠️ Violates HTTP standards (no proper HTTP response)
+
+**Recommendations**:
+
+- Use **Return 404 Mode (default)** for most use cases, especially public-facing services
+- Consider **Drop Connection Mode** for high-security environments where hiding filtering mechanisms is critical
+- Enable detailed logging (`logDeniedAccess`) when using drop mode to facilitate debugging
+- Test thoroughly in your environment before deploying to production
 
 ## Logging and fail2ban Integration
 

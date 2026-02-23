@@ -8,6 +8,7 @@ summary: 'Block or allow requests based on geographic location (country, region,
 testData:
   geoAPIEndpoint: "http://geoip-api:8080/country/{ip}"
   blockEmptyUserAgent: true
+  closeConnectionOnHostReject: false  # Default: return 404 instead of dropping connection
   accessRules:
     US: true
     CA: true

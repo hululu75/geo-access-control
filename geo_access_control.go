@@ -60,6 +60,7 @@ type Config struct {
 	LogLevel                    string                 `json:"logLevel,omitempty"`
 	LogFilePath                 string                 `json:"logFilePath,omitempty"`
 	BlockEmptyUserAgent         bool                   `json:"blockEmptyUserAgent,omitempty"`
+	CloseConnectionOnHostReject bool                   `json:"closeConnectionOnHostReject,omitempty"`
 }
 
 // CreateConfig creates and initializes the default plugin configuration.
@@ -77,6 +78,7 @@ func CreateConfig() *Config {
 		DeniedResponseMessage:       "Not Found",
 		LogLevel:                    "info", // Default log level
 		LogFilePath:                 "",     // Default empty log file path
+		CloseConnectionOnHostReject: false,  // Default: return 404 instead of closing connection
 	}
 }
 
@@ -453,6 +455,24 @@ func (g *GeoAccessControl) ServeHTTP(rw http.ResponseWriter, req *http.Request) 
 	// 4. Check Host-specific User-Agent rules (NEW)
 	if rules, found := g.getHostRules(req.Host); found {
 		if !g.checkUserAgentByRules(req.Header.Get("User-Agent"), rules, req) {
+			if g.config.CloseConnectionOnHostReject {
+				// Drop connection without sending HTTP response
+				hj, ok := rw.(http.Hijacker)
+				if !ok {
+					g.logger.Warnf("ResponseWriter does not support Hijack, returning 404 instead")
+					g.denyRequest(rw, req, g.config.DeniedResponseMessage)
+					return
+				}
+				conn, _, err := hj.Hijack()
+				if err != nil {
+					g.logger.Warnf("Failed to hijack connection: %v", err)
+					g.denyRequest(rw, req, g.config.DeniedResponseMessage)
+					return
+				}
+				conn.Close()
+				return
+			}
+			// Return 404 response (default behavior)
 			g.denyRequest(rw, req, g.config.DeniedResponseMessage)
 			return
 		}
