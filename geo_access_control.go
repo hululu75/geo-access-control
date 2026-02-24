@@ -470,7 +470,7 @@ func (g *GeoAccessControl) ServeHTTP(rw http.ResponseWriter, req *http.Request) 
 		return
 	}
 
-	g.logger.Debugf("Processing request from IP: %s to %s (User-Agent: %s)", clientIP, g.formatURL(req), req.Header.Get("User-Agent"))
+	g.logger.Debugf("Processing request from IP: %s to %s", clientIP, g.formatURL(req))
 
 	// 1. Check excluded paths
 	for _, re := range g.excludedPathRegexps {
@@ -749,7 +749,7 @@ func (g *GeoAccessControl) getGeoData(ip string, req *http.Request) (*GeoData, e
 	apiURL := strings.ReplaceAll(g.geoAPIURLTemplate, "{ip}", ip)
 
 	if g.config.LogGeoAPICalls {
-		g.logger.Debugf("Making GeoAPI call to: %s for IP: %s", apiURL, ip)
+		g.logger.Debugf("Making GeoAPI call to: %s for IP: %s (User-Agent: %s)", apiURL, ip, req.Header.Get("User-Agent"))
 	}
 
 	resp, err := g.httpClient.Get(apiURL)
