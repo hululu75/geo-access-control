@@ -432,8 +432,8 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 	urlTemplate := config.GeoAPIEndpoint
 	if plugin.needCityData {
 		replaced := strings.ReplaceAll(urlTemplate, "/country/", "/city/")
-		if replaced == urlTemplate {
-			pluginLogger.Warnf("city/region-level access rules are configured but geoAPIEndpoint %q does not contain '/country/' for automatic path replacement; ensure the endpoint returns city-level data", urlTemplate)
+		if replaced == urlTemplate && !strings.Contains(urlTemplate, "/city/") {
+			pluginLogger.Warnf("city/region-level access rules are configured but geoAPIEndpoint %q does not contain '/country/' or '/city/'; ensure the endpoint returns city-level data", urlTemplate)
 		}
 		urlTemplate = replaced
 	}
