@@ -1,7 +1,9 @@
 package geo_access_control
 
 import (
+	"bufio"
 	"context"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -420,6 +422,244 @@ func TestBlockEmptyUserAgentPerHost(t *testing.T) {
 	}
 }
 
+// TestEmptyUserAgentFallback covers the cases where a host has rules but no
+// per-host blockEmptyUserAgent config, verifying that:
+//   - the global BlockEmptyUserAgent flag is honoured as a fallback,
+//   - an empty UA is denied with a clear reason when an allowlist is configured,
+//   - an empty UA is allowed when neither the global flag nor an allowlist restricts it.
+func TestEmptyUserAgentFallback(t *testing.T) {
+	boolPtr := func(b bool) *bool { return &b }
+
+	tests := []struct {
+		name                string
+		globalBlockEmpty    bool
+		hostRules           HostRules
+		userAgent           string
+		expectedAllow bool
+	}{
+		{
+			name:             "Global flag blocks empty UA when host has no per-host config",
+			globalBlockEmpty: true,
+			hostRules:        HostRules{BlockedUserAgents: []string{"BadBot"}}, // no BlockEmptyUserAgent
+			userAgent:        "",
+			expectedAllow:    false,
+		},
+		{
+			name:             "Global flag allows empty UA when host has no per-host config",
+			globalBlockEmpty: false,
+			hostRules:        HostRules{BlockedUserAgents: []string{"BadBot"}}, // no BlockEmptyUserAgent
+			userAgent:        "",
+			expectedAllow:    true,
+		},
+		{
+			name:             "Allowlist denies empty UA with clear reason (no per-host config, global=false)",
+			globalBlockEmpty: false,
+			hostRules:        HostRules{AllowedUserAgents: []string{"ValidClient"}},
+			userAgent:        "",
+			expectedAllow:    false,
+		},
+		{
+			name:             "Allowlist still denies empty UA when global=true",
+			globalBlockEmpty: true,
+			hostRules:        HostRules{AllowedUserAgents: []string{"ValidClient"}},
+			userAgent:        "",
+			expectedAllow:    false,
+		},
+		{
+			name:             "Per-host allow overrides global block",
+			globalBlockEmpty: true,
+			hostRules:        HostRules{BlockEmptyUserAgent: boolPtr(false)},
+			userAgent:        "",
+			expectedAllow:    true,
+		},
+		{
+			name:             "Per-host block overrides global allow",
+			globalBlockEmpty: false,
+			hostRules:        HostRules{BlockEmptyUserAgent: boolPtr(true)},
+			userAgent:        "",
+			expectedAllow:    false,
+		},
+		{
+			name:             "Non-empty UA passes allowlist normally",
+			globalBlockEmpty: false,
+			hostRules:        HostRules{AllowedUserAgents: []string{"ValidClient"}},
+			userAgent:        "ValidClient/1.0",
+			expectedAllow:    true,
+		},
+		{
+			name:             "Non-empty UA rejected by allowlist normally",
+			globalBlockEmpty: false,
+			hostRules:        HostRules{AllowedUserAgents: []string{"ValidClient"}},
+			userAgent:        "OtherApp/1.0",
+			expectedAllow:    false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			config := &Config{
+				GeoAPIEndpoint:              "http://test-api",
+				BlockEmptyUserAgent:         tt.globalBlockEmpty,
+				AllowPrivateIPAccess:        false,
+				AllowRequestsWithoutGeoData: true,
+				AccessRules: map[string]interface{}{
+					"US": true,
+				},
+				PerHostRules: map[string]HostRules{
+					"api.example.com": tt.hostRules,
+				},
+			}
+
+			plugin, err := New(context.Background(), nil, config, "test-plugin")
+			if err != nil {
+				t.Fatalf("Failed to create plugin: %v", err)
+			}
+
+			nextCalled := false
+			plugin.(*GeoAccessControl).next = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				nextCalled = true
+				w.WriteHeader(http.StatusOK)
+			})
+
+			rec := httptest.NewRecorder()
+			req, _ := http.NewRequest("GET", "http://api.example.com/test", nil)
+			req.RemoteAddr = "8.8.8.8:1234"
+			req.Header.Set("User-Agent", tt.userAgent)
+
+			plugin.ServeHTTP(rec, req)
+
+			if nextCalled != tt.expectedAllow {
+				t.Errorf("Expected allow=%v for UA %q (global blockEmpty=%v), got allow=%v",
+					tt.expectedAllow, tt.userAgent, tt.globalBlockEmpty, nextCalled)
+			}
+		})
+	}
+}
+
+func TestWildcardRulesSortedBySpecificity(t *testing.T) {
+	config := &Config{
+		GeoAPIEndpoint: "http://test-api",
+		AccessRules: map[string]interface{}{
+			"US": true,
+		},
+		PerHostRules: map[string]HostRules{
+			// Order in map is random; plugin must sort by specificity.
+			"*.com": {
+				BlockedUserAgents: []string{"BroadBlock"},
+			},
+			"*.example.com": {
+				AllowedUserAgents: []string{"SpecificAllow"},
+			},
+			"*.sub.example.com": {
+				AllowedUserAgents: []string{"MostSpecific"},
+			},
+		},
+	}
+
+	plugin, err := New(context.Background(), nil, config, "test-plugin")
+	if err != nil {
+		t.Fatalf("Failed to create plugin: %v", err)
+	}
+	geoPlugin := plugin.(*GeoAccessControl)
+
+	// "app.sub.example.com" should match "*.sub.example.com" (most specific), not "*.example.com"
+	rules, found := geoPlugin.getHostRules("app.sub.example.com")
+	if !found {
+		t.Fatal("Expected to find wildcard rules for app.sub.example.com")
+	}
+	if len(rules.allowedUserAgents) != 1 || rules.allowedUserAgents[0] != "MostSpecific" {
+		t.Errorf("Expected MostSpecific rule, got %v", rules.allowedUserAgents)
+	}
+
+	// "foo.example.com" should match "*.example.com", not "*.com"
+	rules, found = geoPlugin.getHostRules("foo.example.com")
+	if !found {
+		t.Fatal("Expected to find wildcard rules for foo.example.com")
+	}
+	if len(rules.allowedUserAgents) != 1 || rules.allowedUserAgents[0] != "SpecificAllow" {
+		t.Errorf("Expected SpecificAllow rule, got %v", rules.allowedUserAgents)
+	}
+
+	// "random.com" should match "*.com"
+	rules, found = geoPlugin.getHostRules("random.com")
+	if !found {
+		t.Fatal("Expected to find wildcard rules for random.com")
+	}
+	if len(rules.blockedUserAgents) != 1 || rules.blockedUserAgents[0] != "BroadBlock" {
+		t.Errorf("Expected BroadBlock rule, got blocked=%v allowed=%v", rules.blockedUserAgents, rules.allowedUserAgents)
+	}
+}
+
+func TestExtractClientIPPrefersXRealIP(t *testing.T) {
+	config := &Config{
+		GeoAPIEndpoint: "http://test-api",
+		AccessRules: map[string]interface{}{
+			"US": true,
+		},
+	}
+
+	plugin, err := New(context.Background(), nil, config, "test-plugin")
+	if err != nil {
+		t.Fatalf("Failed to create plugin: %v", err)
+	}
+	geoPlugin := plugin.(*GeoAccessControl)
+
+	tests := []struct {
+		name       string
+		xRealIP    string
+		xff        string
+		remoteAddr string
+		expectedIP string
+	}{
+		{
+			name:       "X-Real-IP takes precedence over XFF",
+			xRealIP:    "10.0.0.1",
+			xff:        "192.168.1.1, 172.16.0.1",
+			remoteAddr: "127.0.0.1:1234",
+			expectedIP: "10.0.0.1",
+		},
+		{
+			name:       "Falls back to XFF when X-Real-IP absent",
+			xRealIP:    "",
+			xff:        "203.0.113.5, 172.16.0.1",
+			remoteAddr: "127.0.0.1:1234",
+			expectedIP: "203.0.113.5",
+		},
+		{
+			name:       "Falls back to RemoteAddr when no headers",
+			xRealIP:    "",
+			xff:        "",
+			remoteAddr: "198.51.100.1:1234",
+			expectedIP: "198.51.100.1",
+		},
+		{
+			name:       "Ignores invalid X-Real-IP, uses XFF",
+			xRealIP:    "not-an-ip",
+			xff:        "203.0.113.5",
+			remoteAddr: "127.0.0.1:1234",
+			expectedIP: "203.0.113.5",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req, _ := http.NewRequest("GET", "http://example.com/", nil)
+			req.RemoteAddr = tt.remoteAddr
+			if tt.xRealIP != "" {
+				req.Header.Set("X-Real-IP", tt.xRealIP)
+			}
+			if tt.xff != "" {
+				req.Header.Set("X-Forwarded-For", tt.xff)
+			}
+
+			ip := geoPlugin.extractClientIP(req)
+			if ip != tt.expectedIP {
+				t.Errorf("Expected IP %s, got %s", tt.expectedIP, ip)
+			}
+		})
+	}
+}
+
 func TestExecutionOrder(t *testing.T) {
 	config := &Config{
 		GeoAPIEndpoint:              "http://test-api",
@@ -628,5 +868,80 @@ func TestHostRulesDeniedClosesConnection(t *testing.T) {
 	}
 	if !aborted {
 		t.Error("Expected http.ErrAbortHandler panic when Hijack is not supported")
+	}
+}
+
+// hijackableResponseWriter wraps httptest.ResponseRecorder and implements
+// http.Hijacker so we can test the HTTP/1.x hijack path.
+type hijackableResponseWriter struct {
+	*httptest.ResponseRecorder
+	conn     net.Conn
+	hijacked bool
+}
+
+func (h *hijackableResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	h.hijacked = true
+	rw := bufio.NewReadWriter(bufio.NewReader(h.conn), bufio.NewWriter(h.conn))
+	return h.conn, rw, nil
+}
+
+func TestHostRulesDeniedClosesConnectionHTTP1Hijack(t *testing.T) {
+	config := &Config{
+		GeoAPIEndpoint:              "http://test-api",
+		CloseConnectionOnHostReject: true,
+		AccessRules: map[string]interface{}{
+			"US": true,
+		},
+		PerHostRules: map[string]HostRules{
+			"api.example.com": {
+				AllowedUserAgents: []string{"ValidClient"},
+			},
+		},
+	}
+
+	plugin, err := New(context.Background(), nil, config, "test-plugin")
+	if err != nil {
+		t.Fatalf("Failed to create plugin: %v", err)
+	}
+
+	nextCalled := false
+	plugin.(*GeoAccessControl).next = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		nextCalled = true
+	})
+
+	// Create a pipe to simulate a TCP connection; the plugin will close the
+	// server side, and we verify by reading from the client side.
+	clientConn, serverConn := net.Pipe()
+	defer clientConn.Close()
+
+	hrw := &hijackableResponseWriter{
+		ResponseRecorder: httptest.NewRecorder(),
+		conn:             serverConn,
+	}
+
+	req, _ := http.NewRequest("GET", "http://api.example.com/test", nil)
+	req.RemoteAddr = "8.8.8.8:1234"
+	req.Proto = "HTTP/1.1"
+	req.ProtoMajor = 1
+	req.ProtoMinor = 1
+	req.Header.Set("User-Agent", "InvalidClient")
+
+	// Should NOT panic — hijack succeeds for HTTP/1.x, so connection is
+	// closed directly instead of using panic(http.ErrAbortHandler).
+	plugin.ServeHTTP(hrw, req)
+
+	if nextCalled {
+		t.Error("Expected next handler not to be called")
+	}
+	if !hrw.hijacked {
+		t.Error("Expected Hijack() to be called for HTTP/1.x")
+	}
+
+	// Verify the server side of the connection was closed: a read on the
+	// client side should return an error (EOF or closed pipe).
+	buf := make([]byte, 1)
+	_, readErr := clientConn.Read(buf)
+	if readErr == nil {
+		t.Error("Expected read error on client conn after server conn was closed")
 	}
 }

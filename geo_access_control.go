@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -93,11 +94,11 @@ type GeoAccessControl struct {
 	cache               *LRUCache
 	excludedPathRegexps []*regexp.Regexp
 	privateIPRanges     []*net.IPNet
-	ipRules             []ipRule
-	allowedIPs          []*net.IPNet
-	deniedIPs           []*net.IPNet
-	perHostRules        map[string]*parsedHostRules
+	ipRules      []ipRule
+	perHostRules map[string]*parsedHostRules
 	wildcardRules       []wildcardRule
+	needCityData        bool
+	geoAPIURLTemplate   string
 	httpClient          *http.Client
 	geoFlight           sync.Map
 	logger              *PluginLogger
@@ -215,7 +216,7 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 	var allowedIPStrings, deniedIPStrings []string
 
 	for key, configValue := range config.AccessRules {
-		isCountryCode := len(key) == 2 && key == strings.ToUpper(key)
+		isCountryCode := len(key) == 2 && key[0] >= 'A' && key[0] <= 'Z' && key[1] >= 'A' && key[1] <= 'Z'
 		isIP := net.ParseIP(key) != nil || strings.Contains(key, "/")
 
 		if isCountryCode {
@@ -302,13 +303,18 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 		}
 	}
 
-	// Compile excluded path regexps
+	// Compile excluded path regexps.
+	// Patterns are matched as regex substrings against req.URL.Path.
+	// Use "^" and "$" anchors for exact path matching (e.g., "^/health$").
 	for _, pattern := range config.ExcludedPaths {
 		re, err := regexp.Compile(pattern)
 		if err != nil {
 			plugin.logger.Errorf("failed to compile excluded path pattern %q: %v", pattern, err)
 			closeOnError()
 			return nil, fmt.Errorf("failed to compile excluded path pattern %q: %w", pattern, err)
+		}
+		if len(pattern) > 0 && pattern[0] != '^' {
+			pluginLogger.Warnf("excludedPaths pattern %q is not anchored with '^'; it will match as a substring (e.g., '/health' also matches '/unhealthy')", pattern)
 		}
 		plugin.excludedPathRegexps = append(plugin.excludedPathRegexps, re)
 	}
@@ -322,8 +328,9 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 	var err error
 	plugin.privateIPRanges = parsePrivateIPRanges()
 
+	var allowedIPs, deniedIPs []*net.IPNet
 	if len(allowedIPStrings) > 0 {
-		plugin.allowedIPs, err = parseIPRanges(allowedIPStrings)
+		allowedIPs, err = parseIPRanges(allowedIPStrings)
 		if err != nil {
 			plugin.logger.Errorf("failed to parse allowed IPs: %v", err)
 			closeOnError()
@@ -331,7 +338,7 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 		}
 	}
 	if len(deniedIPStrings) > 0 {
-		plugin.deniedIPs, err = parseIPRanges(deniedIPStrings)
+		deniedIPs, err = parseIPRanges(deniedIPStrings)
 		if err != nil {
 			plugin.logger.Errorf("failed to parse denied IPs: %v", err)
 			closeOnError()
@@ -340,10 +347,10 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 	}
 
 	// Build combined IP rules list for most-specific-wins matching
-	for _, ipNet := range plugin.allowedIPs {
+	for _, ipNet := range allowedIPs {
 		plugin.ipRules = append(plugin.ipRules, ipRule{ipNet: ipNet, allowed: true})
 	}
-	for _, ipNet := range plugin.deniedIPs {
+	for _, ipNet := range deniedIPs {
 		plugin.ipRules = append(plugin.ipRules, ipRule{ipNet: ipNet, allowed: false})
 	}
 
@@ -403,6 +410,42 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 		}
 	}
 
+	// Sort wildcard rules by pattern length descending so that more specific
+	// patterns (e.g., "*.sub.example.com") match before broader ones
+	// (e.g., "*.example.com"). This avoids non-deterministic results from
+	// Go map iteration order.
+	sort.Slice(plugin.wildcardRules, func(i, j int) bool {
+		return len(plugin.wildcardRules[i].pattern) > len(plugin.wildcardRules[j].pattern)
+	})
+
+	// Pre-compute whether city-level geo data is needed so that getGeoData
+	// does not re-scan allowedRules on every request.
+	for _, rule := range plugin.allowedRules {
+		if len(rule.Cities) > 0 || len(rule.Regions) > 0 {
+			plugin.needCityData = true
+			break
+		}
+	}
+
+	// Pre-compute the API URL template (still contains {ip} placeholder)
+	// so getGeoData only needs a single string replacement per request.
+	urlTemplate := config.GeoAPIEndpoint
+	if plugin.needCityData {
+		replaced := strings.ReplaceAll(urlTemplate, "/country/", "/city/")
+		if replaced == urlTemplate {
+			pluginLogger.Warnf("city/region-level access rules are configured but geoAPIEndpoint %q does not contain '/country/' for automatic path replacement; ensure the endpoint returns city-level data", urlTemplate)
+		}
+		urlTemplate = replaced
+	}
+	if config.GeoAPIResponseIsJSON && !strings.Contains(urlTemplate, "format=json") {
+		if strings.Contains(urlTemplate, "?") {
+			urlTemplate += "&format=json"
+		} else {
+			urlTemplate += "?format=json"
+		}
+	}
+	plugin.geoAPIURLTemplate = urlTemplate
+
 	return plugin, nil
 }
 
@@ -423,11 +466,11 @@ func (g *GeoAccessControl) ServeHTTP(rw http.ResponseWriter, req *http.Request) 
 	clientIP := g.extractClientIP(req)
 	if clientIP == "" {
 		g.logger.Warnf("Unable to extract client IP for request to %s", req.Host)
-		g.denyRequest(rw, req, "No client IP found")
+		g.denyRequest(rw, req)
 		return
 	}
 
-	g.logger.Debugf("Processing request from IP: %s to %s", clientIP, g.formatURL(req))
+	g.logger.Debugf("Processing request from IP: %s to %s (User-Agent: %s)", clientIP, g.formatURL(req), req.Header.Get("User-Agent"))
 
 	// 1. Check excluded paths
 	for _, re := range g.excludedPathRegexps {
@@ -449,7 +492,7 @@ func (g *GeoAccessControl) ServeHTTP(rw http.ResponseWriter, req *http.Request) 
 			if g.config.LogDeniedAccess {
 				g.logger.Warnf("Denied request from IP: %s to %s (IP blacklist)", clientIP, g.formatURLForLevel(req, g.logger.level))
 			}
-			g.denyRequest(rw, req, "IP address is denied")
+			g.denyRequest(rw, req)
 		}
 		return
 	}
@@ -463,7 +506,7 @@ func (g *GeoAccessControl) ServeHTTP(rw http.ResponseWriter, req *http.Request) 
 		return
 	}
 
-	// 4. Check Host-specific User-Agent rules (NEW)
+	// 4. Check Host-specific User-Agent rules
 	if rules, found := g.getHostRules(req.Host); found {
 		if !g.checkUserAgentByRules(req.Header.Get("User-Agent"), rules, req) {
 			if g.config.CloseConnectionOnHostReject {
@@ -495,7 +538,7 @@ func (g *GeoAccessControl) ServeHTTP(rw http.ResponseWriter, req *http.Request) 
 				panic(http.ErrAbortHandler)
 			}
 			// Return 404 response (default behavior)
-			g.denyRequest(rw, req, g.config.DeniedResponseMessage)
+			g.denyRequest(rw, req)
 			return
 		}
 		// Host rules passed, continue to geo check
@@ -507,7 +550,7 @@ func (g *GeoAccessControl) ServeHTTP(rw http.ResponseWriter, req *http.Request) 
 				if g.config.LogDeniedAccess {
 					g.logger.Warnf("Denied request from IP: %s to %s (empty User-Agent)", clientIP, g.formatURLForLevel(req, g.logger.level))
 				}
-				g.denyRequest(rw, req, "Empty User-Agent is not allowed")
+				g.denyRequest(rw, req)
 				return
 			}
 		}
@@ -525,7 +568,7 @@ func (g *GeoAccessControl) ServeHTTP(rw http.ResponseWriter, req *http.Request) 
 			}
 			g.next.ServeHTTP(rw, req)
 		} else {
-			g.denyRequest(rw, req, "Could not determine location")
+			g.denyRequest(rw, req)
 		}
 		return
 	}
@@ -540,14 +583,22 @@ func (g *GeoAccessControl) ServeHTTP(rw http.ResponseWriter, req *http.Request) 
 		if g.config.LogDeniedAccess {
 			g.logger.Warnf("Denied request from IP: %s (%s, %s, %s) to %s (blocked: %s)", clientIP, geoData.Country, geoData.Region, geoData.City, g.formatURLForLevel(req, g.logger.level), matchedRule)
 		}
-		g.denyRequest(rw, req, "Location is not allowed")
+		g.denyRequest(rw, req)
 	}
 }
 
 // extractClientIP extracts the client IP from the request.
+// X-Real-IP is checked first because Traefik sets it to the actual peer IP,
+// whereas the leftmost X-Forwarded-For entry can be freely spoofed by the client.
 // Each candidate value is validated with net.ParseIP before being returned,
 // preventing spoofed headers from injecting non-IP strings into downstream logic.
 func (g *GeoAccessControl) extractClientIP(req *http.Request) string {
+	if xri := req.Header.Get("X-Real-IP"); xri != "" {
+		xri = strings.TrimSpace(xri)
+		if net.ParseIP(xri) != nil {
+			return xri
+		}
+	}
 	if xff := req.Header.Get("X-Forwarded-For"); xff != "" {
 		ips := strings.Split(xff, ",")
 		if len(ips) > 0 {
@@ -555,12 +606,6 @@ func (g *GeoAccessControl) extractClientIP(req *http.Request) string {
 			if net.ParseIP(ip) != nil {
 				return ip
 			}
-		}
-	}
-	if xri := req.Header.Get("X-Real-IP"); xri != "" {
-		xri = strings.TrimSpace(xri)
-		if net.ParseIP(xri) != nil {
-			return xri
 		}
 	}
 	ip, _, err := net.SplitHostPort(req.RemoteAddr)
@@ -586,6 +631,8 @@ func (g *GeoAccessControl) isPrivateIP(ipStr string) bool {
 
 // checkIPRules checks if an IP is explicitly allowed or denied.
 // Uses most-specific-wins logic: the rule with the longest prefix match takes precedence.
+// When two rules share the same prefix length (e.g., the same CIDR appears in both
+// allow and deny lists), deny wins — this is the safe default for a security plugin.
 func (g *GeoAccessControl) checkIPRules(ipStr string) (decision bool, determined bool) {
 	ip := net.ParseIP(ipStr)
 	if ip == nil {
@@ -599,7 +646,7 @@ func (g *GeoAccessControl) checkIPRules(ipStr string) (decision bool, determined
 	for _, rule := range g.ipRules {
 		if rule.ipNet.Contains(ip) {
 			prefixLen, _ := rule.ipNet.Mask.Size()
-			if prefixLen > bestPrefixLen {
+			if prefixLen > bestPrefixLen || (prefixLen == bestPrefixLen && !rule.allowed) {
 				bestPrefixLen = prefixLen
 				bestDecision = rule.allowed
 				matched = true
@@ -699,18 +746,7 @@ func (g *GeoAccessControl) getGeoData(ip string, req *http.Request) (*GeoData, e
 		g.geoFlight.Delete(ip)
 	}()
 
-	apiURL := strings.ReplaceAll(g.config.GeoAPIEndpoint, "{ip}", ip)
-	if g.needsCityLevelData() {
-		apiURL = strings.ReplaceAll(apiURL, "/country/", "/city/")
-	}
-
-	if g.config.GeoAPIResponseIsJSON {
-		if strings.Contains(apiURL, "?") {
-			apiURL += "&format=json"
-		} else {
-			apiURL += "?format=json"
-		}
-	}
+	apiURL := strings.ReplaceAll(g.geoAPIURLTemplate, "{ip}", ip)
 
 	if g.config.LogGeoAPICalls {
 		g.logger.Debugf("Making GeoAPI call to: %s for IP: %s", apiURL, ip)
@@ -758,17 +794,21 @@ func (g *GeoAccessControl) getGeoData(ip string, req *http.Request) (*GeoData, e
 		geoData.City = apiResp.City
 		geoData.Region = apiResp.Region
 	} else {
-		// Handle plain text response
+		// Plain text response format: "country|city|region" (pipe-separated).
+		// Only the first field (country) is required; city and region are optional.
+		// If the GeoIP API uses a different field order, set geoAPIResponseIsJSON
+		// to true and use the JSON format instead.
 		parts := strings.Split(string(body), "|")
 		if len(parts) > 0 {
-			geoData.Country = parts[0]
+			geoData.Country = strings.TrimSpace(parts[0])
 		}
 		if len(parts) > 1 {
-			geoData.City = parts[1]
+			geoData.City = strings.TrimSpace(parts[1])
 		}
 		if len(parts) > 2 {
-			geoData.Region = parts[2]
+			geoData.Region = strings.TrimSpace(parts[2])
 		}
+		g.logger.Debugf("Parsed plain text geo response for IP %s: country=%q city=%q region=%q", ip, geoData.Country, geoData.City, geoData.Region)
 	}
 
 	g.cache.Set(ip, geoData)
@@ -776,8 +816,8 @@ func (g *GeoAccessControl) getGeoData(ip string, req *http.Request) (*GeoData, e
 	return geoData, nil
 }
 
-// denyRequest sends a denial response.
-func (g *GeoAccessControl) denyRequest(rw http.ResponseWriter, req *http.Request, reason string) {
+// denyRequest sends a denial response using the configured status code and message.
+func (g *GeoAccessControl) denyRequest(rw http.ResponseWriter, req *http.Request) {
 	if g.config.RedirectURL != "" {
 		http.Redirect(rw, req, g.config.RedirectURL, http.StatusTemporaryRedirect)
 		return
@@ -785,16 +825,6 @@ func (g *GeoAccessControl) denyRequest(rw http.ResponseWriter, req *http.Request
 	rw.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	rw.WriteHeader(g.config.DeniedStatusCode)
 	rw.Write([]byte(g.config.DeniedResponseMessage))
-}
-
-// needsCityLevelData checks if city-level data is required.
-func (g *GeoAccessControl) needsCityLevelData() bool {
-	for _, countryRule := range g.allowedRules {
-		if len(countryRule.Cities) > 0 || len(countryRule.Regions) > 0 {
-			return true
-		}
-	}
-	return false
 }
 
 // parsePrivateIPRanges parses the private IP ranges.
@@ -958,16 +988,34 @@ func (g *GeoAccessControl) getHostRules(host string) (*parsedHostRules, bool) {
 func (g *GeoAccessControl) checkUserAgentByRules(userAgent string, rules *parsedHostRules, req *http.Request) bool {
 	userAgent = strings.TrimSpace(userAgent)
 
-	if rules.hasBlockEmptyConfig {
-		if userAgent == "" {
+	// Handle empty User-Agent up front so the blocked/allowed checks below
+	// only ever run against non-empty strings.
+	if userAgent == "" {
+		if rules.hasBlockEmptyConfig {
+			// Per-host setting takes precedence over the global flag.
 			if rules.blockEmptyUserAgent {
 				if g.config.LogDeniedAccess {
 					g.logger.Warnf("Denied request to %s (empty User-Agent by host rule)", req.Host)
 				}
 				return false
 			}
-			return true
+			return true // per-host explicitly allows empty UA
 		}
+		// No per-host config: fall back to the global BlockEmptyUserAgent flag.
+		if g.config.BlockEmptyUserAgent {
+			if g.config.LogDeniedAccess {
+				g.logger.Warnf("Denied request to %s (empty User-Agent, global rule)", req.Host)
+			}
+			return false
+		}
+		// An empty UA can never satisfy an allowlist.
+		if len(rules.allowedUserAgents) > 0 || len(rules.allowedUserAgentRegexps) > 0 {
+			if g.config.LogDeniedAccess {
+				g.logger.Warnf("Denied request to %s (empty User-Agent not in allowed list)", req.Host)
+			}
+			return false
+		}
+		return true
 	}
 
 	for _, blockedUA := range rules.blockedUserAgents {
@@ -1002,7 +1050,7 @@ func (g *GeoAccessControl) checkUserAgentByRules(userAgent string, rules *parsed
 		}
 
 		if g.config.LogDeniedAccess {
-			g.logger.Warnf("Denied request to %s (User-Agent not in whitelist)", req.Host)
+			g.logger.Warnf("Denied request to %s (User-Agent not in allowed list)", req.Host)
 		}
 		return false
 	}
