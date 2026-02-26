@@ -81,6 +81,7 @@ func CreateConfig() *Config {
 		DeniedResponseMessage:       "Not Found",
 		LogLevel:                    "info", // Default log level
 		LogFilePath:                 "",     // Default empty log file path
+		BlockEmptyUserAgent:         true,   // Default: block empty User-Agent
 		CloseConnectionOnHostReject: false,  // Default: return 404 instead of closing connection
 	}
 }
@@ -94,8 +95,8 @@ type GeoAccessControl struct {
 	cache               *LRUCache
 	excludedPathRegexps []*regexp.Regexp
 	privateIPRanges     []*net.IPNet
-	ipRules      []ipRule
-	perHostRules map[string]*parsedHostRules
+	ipRules             []ipRule
+	perHostRules        map[string]*parsedHostRules
 	wildcardRules       []wildcardRule
 	needCityData        bool
 	geoAPIURLTemplate   string
