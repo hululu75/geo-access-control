@@ -3,11 +3,19 @@ type: middleware
 
 import: github.com/hululu75/geo-access-control
 
-summary: 'Block or allow requests based on geographic location (country, region, city)'
+summary: 'Block or allow requests based on geographic location (country, region, city) and User-Agent'
 
 testData:
   geoAPIEndpoint: "http://geoip-api:8080/country/{ip}"
+  blockEmptyUserAgent: true
+  closeConnectionOnHostReject: false  # Default: return 404 instead of dropping connection
   accessRules:
     US: true
     CA: true
     GB: true
+  perHostRules:
+    api.example.com:
+      allowedUserAgents:
+        - "MyApiClient"
+      blockedUserAgentPatterns:
+        - ".*bot.*"

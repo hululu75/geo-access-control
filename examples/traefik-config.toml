@@ -1,0 +1,80 @@
+# Example Traefik Configuration with Geo Access Control (TOML format)
+
+# Static Configuration (traefik.toml)
+[experimental.localPlugins.geo-access-control]
+  moduleName = "github.com/hululu75/geo-access-control"
+
+# Dynamic Configuration (config.toml)
+
+# Example 1: Basic allow/deny
+[http.middlewares.geo-simple.plugin.geo-access-control]
+  geoAPIEndpoint = "http://geoip-api:8080/country/{ip}"
+
+  [http.middlewares.geo-simple.plugin.geo-access-control.accessRules]
+    US = true  # Allow US
+    CA = true  # Allow Canada
+    KP = false # Deny North Korea
+
+# Example 2: IP-based rules
+[http.middlewares.ip-rules.plugin.geo-access-control]
+  geoAPIEndpoint = "http://geoip-api:8080/country/{ip}"
+
+  [http.middlewares.ip-rules.plugin.geo-access-control.accessRules]
+    "1.1.1.1" = false      # Deny a specific IP
+    "8.8.0.0/16" = true    # Allow a CIDR range
+
+# Example 3: Complex hierarchical rules
+[http.middlewares.geo-complex.plugin.geo-access-control]
+  geoAPIEndpoint = "http://geoip-api:8080/country/{ip}"
+
+  # IP rules take precedence
+  [http.middlewares.geo-complex.plugin.geo-access-control.accessRules]
+    "10.0.0.0/8" = false
+    US = true  # Allow all of US
+
+  # Country with region rules - GB
+  [http.middlewares.geo-complex.plugin.geo-access-control.accessRules.GB.regions.SCO]
+    allowed = false  # Deny Scotland
+
+  [http.middlewares.geo-complex.plugin.geo-access-control.accessRules.GB.regions.ENG]
+    cities = ["London"]  # Allow London
+
+  # Country with region rules - CN
+  [http.middlewares.geo-complex.plugin.geo-access-control.accessRules.CN.regions.HK]
+    allowed = false  # Deny Hong Kong
+
+# Example 4: Full configuration with all options
+[http.middlewares.geo-full.plugin.geo-access-control]
+  geoAPIEndpoint = "http://geoip-api:8080/country/{ip}"
+  geoAPITimeout = 1000
+  geoAPIResponseIsJSON = true
+  allowPrivateIPAccess = true
+  allowRequestsWithoutGeoData = false
+  deniedStatusCode = 403
+  deniedResponseMessage = "Access Denied"
+  redirectURL = ""
+  cacheSize = 100
+  logAllowedAccess = false
+  logDeniedAccess = true
+  logGeoAPICalls = false
+  logPrivateIPAccess = false
+  logWhiteListAccess = false
+  logLevel = "info"
+  logFilePath = "/var/log/traefik/geo-access.log"
+  excludedPaths = ["/health", "/metrics"]
+
+  [http.middlewares.geo-full.plugin.geo-access-control.accessRules]
+    "1.2.3.4" = true
+    US = true
+    KP = false
+
+# Router configuration
+[http.routers.my-app]
+  rule = "Host(`myapp.example.com`)"
+  service = "my-app-service"
+  middlewares = ["geo-complex"]
+
+# Service configuration
+[http.services.my-app-service.loadBalancer]
+  [[http.services.my-app-service.loadBalancer.servers]]
+    url = "http://localhost:8000"
