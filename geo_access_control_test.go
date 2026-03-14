@@ -6,6 +6,8 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -122,7 +124,7 @@ func TestAccess(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			// Simplified check logic for test purposes
 			decision := false
-			if dec, det := geoPlugin.checkIPRules(tt.clientIP); det {
+			if dec, det, _ := geoPlugin.checkIPRules(tt.clientIP); det {
 				decision = dec
 			} else {
 				decision, _ = geoPlugin.checkGeoAccess(tt.geoData)
@@ -883,6 +885,145 @@ func (h *hijackableResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error)
 	h.hijacked = true
 	rw := bufio.NewReadWriter(bufio.NewReader(h.conn), bufio.NewWriter(h.conn))
 	return h.conn, rw, nil
+}
+
+func TestGetGeoDataSingleflightDeduplication(t *testing.T) {
+	const numGoroutines = 10
+
+	// gate blocks the API handler until we're sure all goroutines are queued.
+	gate := make(chan struct{})
+	// apiCalled is closed when the first API request arrives.
+	apiCalled := make(chan struct{})
+	var apiCallCount int32
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if atomic.AddInt32(&apiCallCount, 1) == 1 {
+			close(apiCalled)
+		}
+		<-gate
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"country":"US","city":"NYC","region":"NY"}`))
+	}))
+	defer server.Close()
+
+	config := &Config{
+		GeoAPIEndpoint:       server.URL + "/country/{ip}",
+		GeoAPIResponseIsJSON: true,
+		GeoAPITimeout:        5000,
+		AccessRules:          map[string]interface{}{"US": true},
+	}
+	plugin, err := New(context.Background(), nil, config, "test-plugin")
+	if err != nil {
+		t.Fatalf("Failed to create plugin: %v", err)
+	}
+	geoPlugin := plugin.(*GeoAccessControl)
+
+	results := make([]*GeoData, numGoroutines)
+	errors := make([]error, numGoroutines)
+
+	// Barrier ensures all goroutines start calling getGeoData at the same time.
+	var barrier sync.WaitGroup
+	barrier.Add(numGoroutines)
+	var wg sync.WaitGroup
+	for i := 0; i < numGoroutines; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			barrier.Done()
+			barrier.Wait()
+			req, _ := http.NewRequest("GET", "/", nil)
+			results[idx], errors[idx] = geoPlugin.getGeoData("1.2.3.4", req)
+		}(i)
+	}
+
+	// Wait for the first API call to arrive, then give other goroutines
+	// a moment to reach wg.Wait() inside the singleflight before releasing.
+	<-apiCalled
+	time.Sleep(20 * time.Millisecond)
+	close(gate)
+
+	wg.Wait()
+
+	if got := atomic.LoadInt32(&apiCallCount); got != 1 {
+		t.Errorf("singleflight: expected 1 API call, got %d", got)
+	}
+	for i, result := range results {
+		if errors[i] != nil {
+			t.Errorf("goroutine %d: unexpected error: %v", i, errors[i])
+			continue
+		}
+		if result == nil {
+			t.Errorf("goroutine %d: expected non-nil result", i)
+			continue
+		}
+		if result.Country != "US" {
+			t.Errorf("goroutine %d: expected country US, got %q", i, result.Country)
+		}
+	}
+}
+
+func TestGetGeoDataSingleflightErrorPropagation(t *testing.T) {
+	const numGoroutines = 5
+
+	gate := make(chan struct{})
+	apiCalled := make(chan struct{})
+	var apiCallCount int32
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if atomic.AddInt32(&apiCallCount, 1) == 1 {
+			close(apiCalled)
+		}
+		<-gate
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer server.Close()
+
+	config := &Config{
+		GeoAPIEndpoint:       server.URL + "/country/{ip}",
+		GeoAPIResponseIsJSON: true,
+		GeoAPITimeout:        5000,
+		AccessRules:          map[string]interface{}{"US": true},
+	}
+	plugin, err := New(context.Background(), nil, config, "test-plugin")
+	if err != nil {
+		t.Fatalf("Failed to create plugin: %v", err)
+	}
+	geoPlugin := plugin.(*GeoAccessControl)
+
+	results := make([]*GeoData, numGoroutines)
+	errors := make([]error, numGoroutines)
+
+	var barrier sync.WaitGroup
+	barrier.Add(numGoroutines)
+	var wg sync.WaitGroup
+	for i := 0; i < numGoroutines; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			barrier.Done()
+			barrier.Wait()
+			req, _ := http.NewRequest("GET", "/", nil)
+			results[idx], errors[idx] = geoPlugin.getGeoData("5.6.7.8", req)
+		}(i)
+	}
+
+	<-apiCalled
+	time.Sleep(20 * time.Millisecond)
+	close(gate)
+
+	wg.Wait()
+
+	if got := atomic.LoadInt32(&apiCallCount); got != 1 {
+		t.Errorf("singleflight: expected 1 API call on error, got %d", got)
+	}
+	for i, err := range errors {
+		if err == nil {
+			t.Errorf("goroutine %d: expected error, got result %+v", i, results[i])
+		}
+		if results[i] != nil {
+			t.Errorf("goroutine %d: expected nil result on error, got %+v", i, results[i])
+		}
+	}
 }
 
 func TestHostRulesDeniedClosesConnectionHTTP1Hijack(t *testing.T) {

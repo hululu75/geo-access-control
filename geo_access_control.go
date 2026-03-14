@@ -43,6 +43,7 @@ type CountryRules struct {
 // Config holds the plugin configuration.
 type Config struct {
 	GeoAPIEndpoint              string                 `json:"geoAPIEndpoint,omitempty"`
+	GeoAPICityEndpoint          string                 `json:"geoAPICityEndpoint,omitempty"`
 	GeoAPITimeout               int                    `json:"geoAPITimeout,omitempty"`
 	GeoAPIResponseIsJSON        bool                   `json:"geoAPIResponseIsJSON,omitempty"`
 	AccessRules                 map[string]interface{} `json:"accessRules,omitempty"`
@@ -188,6 +189,9 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 	if config.GeoAPITimeout <= 0 {
 		pluginLogger.Warnf("geoAPITimeout %d is invalid, defaulting to 750ms", config.GeoAPITimeout)
 		config.GeoAPITimeout = 750
+	} else if config.GeoAPITimeout > 30000 {
+		pluginLogger.Warnf("geoAPITimeout %dms exceeds 30s, capping to 30000ms", config.GeoAPITimeout)
+		config.GeoAPITimeout = 30000
 	}
 	if config.DeniedStatusCode < 100 || config.DeniedStatusCode > 599 {
 		pluginLogger.Warnf("deniedStatusCode %d is invalid, defaulting to 404", config.DeniedStatusCode)
@@ -394,7 +398,8 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 
 		// Check if it's a wildcard rule
 		if strings.Contains(host, "*") {
-			regexPattern := wildcardToRegex(host)
+			lowerHost := strings.ToLower(host)
+			regexPattern := wildcardToRegex(lowerHost)
 			re, err := regexp.Compile(regexPattern)
 			if err != nil {
 				plugin.logger.Errorf("failed to compile wildcard host pattern %q: %v", host, err)
@@ -402,12 +407,12 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 				return nil, fmt.Errorf("failed to compile wildcard host pattern %q: %w", host, err)
 			}
 			plugin.wildcardRules = append(plugin.wildcardRules, wildcardRule{
-				pattern:  host,
+				pattern:  lowerHost,
 				compiled: re,
 				rules:    parsedRules,
 			})
 		} else {
-			plugin.perHostRules[host] = parsedRules
+			plugin.perHostRules[strings.ToLower(host)] = parsedRules
 		}
 	}
 
@@ -432,11 +437,18 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 	// so getGeoData only needs a single string replacement per request.
 	urlTemplate := config.GeoAPIEndpoint
 	if plugin.needCityData {
-		replaced := strings.ReplaceAll(urlTemplate, "/country/", "/city/")
-		if replaced == urlTemplate && !strings.Contains(urlTemplate, "/city/") {
-			pluginLogger.Warnf("city/region-level access rules are configured but geoAPIEndpoint %q does not contain '/country/' or '/city/'; ensure the endpoint returns city-level data", urlTemplate)
+		if config.GeoAPICityEndpoint != "" {
+			// Explicit city endpoint takes precedence — no fragile string replacement needed.
+			urlTemplate = config.GeoAPICityEndpoint
+		} else {
+			// Fallback: attempt the legacy /country/ → /city/ substitution for
+			// backwards compatibility with setups that share a single base URL.
+			replaced := strings.ReplaceAll(urlTemplate, "/country/", "/city/")
+			if replaced == urlTemplate && !strings.Contains(urlTemplate, "/city/") {
+				pluginLogger.Warnf("city/region-level rules are configured but geoAPIEndpoint %q does not contain '/country/' or '/city/'; consider setting geoAPICityEndpoint explicitly", urlTemplate)
+			}
+			urlTemplate = replaced
 		}
-		urlTemplate = replaced
 	}
 	if config.GeoAPIResponseIsJSON && !strings.Contains(urlTemplate, "format=json") {
 		if strings.Contains(urlTemplate, "?") {
@@ -483,15 +495,15 @@ func (g *GeoAccessControl) ServeHTTP(rw http.ResponseWriter, req *http.Request) 
 	}
 
 	// 2. Check IP whitelist/blacklist (explicit IP rules)
-	if decision, determined := g.checkIPRules(clientIP); determined {
+	if decision, determined, matchedCIDR := g.checkIPRules(clientIP); determined {
 		if decision {
 			if g.config.LogWhiteListAccess {
-				g.logger.Infof("Allowed request from IP: %s to %s (IP whitelist)", clientIP, g.formatURLForLevel(req, g.logger.level))
+				g.logger.Infof("Allowed request from IP: %s to %s (IP whitelist, matched: %s)", clientIP, g.formatURLForLevel(req, g.logger.level), matchedCIDR)
 			}
 			g.next.ServeHTTP(rw, req)
 		} else {
 			if g.config.LogDeniedAccess {
-				g.logger.Warnf("Denied request from IP: %s to %s (IP blacklist)", clientIP, g.formatURLForLevel(req, g.logger.level))
+				g.logger.Warnf("Denied request from IP: %s to %s (IP blacklist, matched: %s)", clientIP, g.formatURLForLevel(req, g.logger.level), matchedCIDR)
 			}
 			g.denyRequest(rw, req)
 		}
@@ -634,15 +646,16 @@ func (g *GeoAccessControl) isPrivateIP(ipStr string) bool {
 // Uses most-specific-wins logic: the rule with the longest prefix match takes precedence.
 // When two rules share the same prefix length (e.g., the same CIDR appears in both
 // allow and deny lists), deny wins — this is the safe default for a security plugin.
-func (g *GeoAccessControl) checkIPRules(ipStr string) (decision bool, determined bool) {
+func (g *GeoAccessControl) checkIPRules(ipStr string) (decision bool, determined bool, matchedCIDR string) {
 	ip := net.ParseIP(ipStr)
 	if ip == nil {
-		return false, false
+		return false, false, ""
 	}
 
 	bestPrefixLen := -1
 	bestDecision := false
 	matched := false
+	bestCIDR := ""
 
 	for _, rule := range g.ipRules {
 		if rule.ipNet.Contains(ip) {
@@ -650,12 +663,13 @@ func (g *GeoAccessControl) checkIPRules(ipStr string) (decision bool, determined
 			if prefixLen > bestPrefixLen || (prefixLen == bestPrefixLen && !rule.allowed) {
 				bestPrefixLen = prefixLen
 				bestDecision = rule.allowed
+				bestCIDR = rule.ipNet.String()
 				matched = true
 			}
 		}
 	}
 
-	return bestDecision, matched
+	return bestDecision, matched, bestCIDR
 }
 
 // checkGeoAccess determines if access should be allowed based on geo data and hierarchical rules.
@@ -799,7 +813,7 @@ func (g *GeoAccessControl) getGeoData(ip string, req *http.Request) (*GeoData, e
 		// Only the first field (country) is required; city and region are optional.
 		// If the GeoIP API uses a different field order, set geoAPIResponseIsJSON
 		// to true and use the JSON format instead.
-		parts := strings.Split(string(body), "|")
+		parts := strings.SplitN(string(body), "|", 3)
 		if len(parts) > 0 {
 			geoData.Country = strings.TrimSpace(parts[0])
 		}
@@ -960,6 +974,7 @@ func (g *GeoAccessControl) formatURLForLevel(req *http.Request, level LogLevel) 
 // getHostRules finds rules matching the current request host.
 // Supports exact match, wildcard match, and host with port.
 func (g *GeoAccessControl) getHostRules(host string) (*parsedHostRules, bool) {
+	host = strings.ToLower(host)
 	if rules, found := g.perHostRules[host]; found {
 		return rules, true
 	}
@@ -1031,7 +1046,7 @@ func (g *GeoAccessControl) checkUserAgentByRules(userAgent string, rules *parsed
 	for _, pattern := range rules.blockedUserAgentRegexps {
 		if pattern.MatchString(userAgent) {
 			if g.config.LogDeniedAccess {
-				g.logger.Warnf("Denied request to %s (User-Agent blocked by regex)", req.Host)
+				g.logger.Warnf("Denied request to %s (User-Agent blocked by regex: %s)", req.Host, pattern.String())
 			}
 			return false
 		}
