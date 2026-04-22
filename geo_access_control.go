@@ -1066,7 +1066,11 @@ func (g *GeoAccessControl) checkUserAgentByRules(userAgent string, rules *parsed
 		}
 
 		if g.config.LogDeniedAccess {
-			g.logger.Warnf("Denied request to %s (User-Agent not in allowed list)", req.Host)
+			if g.logger.level == LevelDebug {
+				g.logger.Warnf("Denied request to %s (User-Agent not in allowed list, User-Agent: %s)", req.Host, userAgent)
+			} else {
+				g.logger.Warnf("Denied request to %s (User-Agent not in allowed list)", req.Host)
+			}
 		}
 		return false
 	}
