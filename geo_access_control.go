@@ -186,6 +186,10 @@ func New(ctx context.Context, next http.Handler, config *Config, name string) (h
 		pluginLogger.Warnf("cacheSize %d is invalid, defaulting to 100", config.CacheSize)
 		config.CacheSize = 100
 	}
+	if config.CacheTTL < 0 {
+		pluginLogger.Warnf("cacheTTL %d is invalid (negative), defaulting to 3600", config.CacheTTL)
+		config.CacheTTL = 3600
+	}
 	if config.GeoAPITimeout <= 0 {
 		pluginLogger.Warnf("geoAPITimeout %d is invalid, defaulting to 750ms", config.GeoAPITimeout)
 		config.GeoAPITimeout = 750
@@ -483,7 +487,7 @@ func (g *GeoAccessControl) ServeHTTP(rw http.ResponseWriter, req *http.Request) 
 		return
 	}
 
-	g.logger.Debugf("Processing request from IP: %s to %s", clientIP, g.formatURL(req))
+	g.logger.Debugf("Processing request from IP: %s to %s", clientIP, g.sanitizeLogURL(req))
 
 	// 1. Check excluded paths
 	for _, re := range g.excludedPathRegexps {
@@ -749,9 +753,16 @@ func (g *GeoAccessControl) getGeoData(ip string, req *http.Request) (*GeoData, e
 
 	// Fix 4: Singleflight — deduplicate concurrent requests for the same IP so
 	// that only one outbound API call is made while other goroutines wait.
+	//
+	// wg.Add(1) must happen BEFORE LoadOrStore to avoid a race: if we added
+	// the counter after storing, another goroutine could find the entry and
+	// call wg.Wait() while the counter is still 0 (returns immediately with
+	// uninitialized data). When we lose the race (loaded=true), we immediately
+	// undo the Add so the discarded newCall's WaitGroup stays at zero.
 	newCall := &geoCall{}
 	newCall.wg.Add(1)
 	if actual, loaded := g.geoFlight.LoadOrStore(ip, newCall); loaded {
+		newCall.wg.Done()
 		existing := actual.(*geoCall)
 		existing.wg.Wait()
 		return existing.val, existing.err
@@ -955,20 +966,46 @@ func getScheme(req *http.Request) string {
 	return "http"
 }
 
-// formatURL returns the full URL for debug logging.
-func (g *GeoAccessControl) formatURL(req *http.Request) string {
-	scheme := getScheme(req)
-	return fmt.Sprintf("%s://%s%s", scheme, req.Host, req.URL.Path)
-}
-
 // formatURLForLevel returns URL format based on log level.
 // Debug: full URL with path (e.g., https://example.com/api/users)
 // Info and above: just the host (e.g., example.com)
 func (g *GeoAccessControl) formatURLForLevel(req *http.Request, level LogLevel) string {
 	if level <= LevelDebug {
-		return g.formatURL(req)
+		return g.sanitizeLogURL(req)
 	}
-	return req.Host
+	return g.sanitizeHost(req.Host)
+}
+
+// sanitizeLogURL returns a sanitized full URL for logging.
+// Removes newlines and other control characters that could
+// inject malicious content into log files.
+func (g *GeoAccessControl) sanitizeLogURL(req *http.Request) string {
+	scheme := getScheme(req)
+	host := g.sanitizeHost(req.Host)
+	path := sanitizeLogString(req.URL.Path)
+	return fmt.Sprintf("%s://%s%s", scheme, host, path)
+}
+
+// sanitizeHost removes control characters from host for safe logging.
+func (g *GeoAccessControl) sanitizeHost(host string) string {
+	return sanitizeLogString(host)
+}
+
+// sanitizeLogString removes newlines, carriage returns, and
+// other control characters from a string before logging.
+func sanitizeLogString(s string) string {
+	var result strings.Builder
+	result.Grow(len(s))
+	for _, r := range s {
+		if r == '\n' || r == '\r' || r == '\t' {
+			result.WriteByte(' ')
+		} else if r < 32 || r == 127 {
+			continue
+		} else {
+			result.WriteRune(r)
+		}
+	}
+	return result.String()
 }
 
 // getHostRules finds rules matching the current request host.
